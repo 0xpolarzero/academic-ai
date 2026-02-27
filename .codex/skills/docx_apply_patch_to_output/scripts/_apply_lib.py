@@ -38,6 +38,11 @@ COMMENTS_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordproce
 COMMENTS_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
 COMMENTS_PART = PurePosixPath("word/comments.xml")
 
+# The current applier rebuilds paragraph contents from flattened text tokens.
+# Restrict edits to simple paragraphs with only direct runs to avoid dropping
+# structural OOXML wrappers such as hyperlinks/bookmarks/fields.
+SUPPORTED_PARAGRAPH_CHILDREN = {"pPr", "r"}
+
 
 ET.register_namespace("w", W_NS)
 ET.register_namespace("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
@@ -290,6 +295,13 @@ def _paragraph_text(paragraph: ET.Element) -> str:
         if node.tag in {qn(W_NS, "br"), qn(W_NS, "cr")}:
             chunks.append("\n")
     return "".join(chunks)
+
+
+def _paragraph_has_unsupported_structure(paragraph: ET.Element) -> bool:
+    for child in list(paragraph):
+        if _local_name(child.tag) not in SUPPORTED_PARAGRAPH_CHILDREN:
+            return True
+    return False
 
 
 def _clone_rpr_from_pool(style_pool: dict[str, ET.Element], style_key: str) -> ET.Element | None:
@@ -869,6 +881,13 @@ def apply_patch_to_output(
             continue
 
         paragraph = paragraphs[locator.paragraph_index_in_part]
+        if _paragraph_has_unsupported_structure(paragraph):
+            for record in group_records:
+                entry = record["log_entry"]
+                entry["status"] = "skipped"
+                entry["reason"] = "unsupported_paragraph_structure"
+            continue
+
         tokens, style_pool = _paragraph_tokens(paragraph)
         paragraph_text = "".join(token.char for token in tokens)
         _, utf16_to_cp = _utf16_map(paragraph_text)
@@ -1057,6 +1076,9 @@ def apply_patch_to_output(
             "skipped_ops": skipped_ops,
             "applied_edit_ops": applied_edit_ops,
             "applied_comment_ops": applied_comment_ops,
+            "skipped_unsupported_paragraph_structure": sum(
+                1 for item in log_entries if item.get("reason") == "unsupported_paragraph_structure"
+            ),
             "parts_modified": sorted(parts_modified),
             "parts_with_comments": sorted(parts_with_comments),
         },

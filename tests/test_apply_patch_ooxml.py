@@ -79,6 +79,62 @@ def _build_minimal_docx(path: Path, text: str) -> None:
             zf.writestr(part_name, payload)
 
 
+def _build_structured_docx_with_fld_simple(path: Path, text: str) -> None:
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>
+"""
+
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>
+"""
+
+    document_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>
+"""
+
+    beta_start = text.index("beta")
+    beta_end = beta_start + len("beta")
+    left = text[:beta_start]
+    right = text[beta_end:]
+
+    left_space = ' xml:space="preserve"' if left and (left[0].isspace() or left[-1].isspace()) else ""
+    right_space = ' xml:space="preserve"' if right and (right[0].isspace() or right[-1].isspace()) else ""
+
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="00A1B2C3">
+      <w:r><w:t{left_space}>{left}</w:t></w:r>
+      <w:fldSimple w:instr=' HYPERLINK "https://example.com" '>
+        <w:r><w:t>beta</w:t></w:r>
+      </w:fldSimple>
+      <w:r><w:t{right_space}>{right}</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+    parts = {
+        "[Content_Types].xml": content_types,
+        "_rels/.rels": root_rels,
+        "word/document.xml": document_xml,
+        "word/_rels/document.xml.rels": document_rels,
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for part_name, payload in parts.items():
+            zf.writestr(part_name, payload)
+
+
 def _build_review_units(path: Path, text: str, *, include_paragraph_index: bool = True) -> None:
     location = {
         "part_index": 0,
@@ -221,6 +277,33 @@ def _build_mismatch_patch(path: Path, text: str) -> None:
                     "range": {"start": replace_start, "end": replace_end},
                     "expected": {"snippet": "WRONG"},
                     "replacement": "BETA",
+                }
+            ],
+        },
+    )
+
+
+def _build_add_comment_only_patch(path: Path, text: str) -> None:
+    comment_start = text.index("beta")
+    comment_end = comment_start + len("beta")
+
+    _write_json(
+        path,
+        {
+            "schema_version": "patch.v1",
+            "created_at": "2026-02-27T00:00:00Z",
+            "author": "test",
+            "ops": [
+                {
+                    "type": "add_comment",
+                    "target": {
+                        "part": "word/document.xml",
+                        "para_id": "para_test",
+                        "unit_uid": "unit_test",
+                    },
+                    "range": {"start": comment_start, "end": comment_end},
+                    "expected": {"snippet": "beta"},
+                    "comment_text": "Structured paragraph should skip comments.",
                 }
             ],
         },
@@ -396,3 +479,99 @@ def test_apply_patch_uses_path_hint_when_paragraph_index_is_missing(tmp_path: Pa
     op_entry = log_payload["ops"][0]
     assert op_entry["status"] == "applied"
     assert op_entry["resolved_target"]["paragraph_index_in_part"] == 0
+
+
+def test_structured_paragraph_replace_range_is_skipped_without_xml_mutation(tmp_path: Path) -> None:
+    base_text = "Alpha beta gamma delta."
+
+    source_docx = tmp_path / "source.docx"
+    patch_path = tmp_path / "artifacts/patch/merged_patch.json"
+    review_units_path = tmp_path / "artifacts/docx_extract/review_units.json"
+    output_docx = tmp_path / "output/annotated.docx"
+    apply_log = tmp_path / "artifacts/apply/apply_log.json"
+
+    _build_structured_docx_with_fld_simple(source_docx, base_text)
+    _build_replace_only_patch(patch_path, base_text)
+    _build_review_units(review_units_path, base_text)
+
+    with zipfile.ZipFile(source_docx, mode="r") as zf:
+        source_document_xml = zf.read("word/document.xml")
+
+    _run_apply(
+        source_docx=source_docx,
+        patch_path=patch_path,
+        review_units_path=review_units_path,
+        output_docx=output_docx,
+        apply_log=apply_log,
+    )
+
+    with zipfile.ZipFile(output_docx, mode="r") as zf:
+        assert zf.testzip() is None, "Output DOCX is not a valid zip package"
+        output_document_xml = zf.read("word/document.xml")
+        document_root = ET.fromstring(output_document_xml)
+
+    assert document_root.find(".//w:ins", NS) is None
+    assert document_root.find(".//w:del", NS) is None
+    assert document_root.find(".//w:delText", NS) is None
+    assert document_root.find(".//w:fldSimple", NS) is not None, "Structured element must remain intact"
+    assert output_document_xml == source_document_xml
+
+    log_payload = json.loads(apply_log.read_text(encoding="utf-8"))
+    assert log_payload["stats"]["input_ops"] == 1
+    assert log_payload["stats"]["applied_ops"] == 0
+    assert log_payload["stats"]["skipped_ops"] == 1
+    assert log_payload["stats"]["skipped_unsupported_paragraph_structure"] == 1
+
+    op_entry = log_payload["ops"][0]
+    assert op_entry["status"] == "skipped"
+    assert op_entry["reason"] == "unsupported_paragraph_structure"
+
+
+def test_structured_paragraph_add_comment_is_skipped_without_creating_comments(tmp_path: Path) -> None:
+    base_text = "Alpha beta gamma delta."
+
+    source_docx = tmp_path / "source.docx"
+    patch_path = tmp_path / "artifacts/patch/merged_patch.json"
+    review_units_path = tmp_path / "artifacts/docx_extract/review_units.json"
+    output_docx = tmp_path / "output/annotated.docx"
+    apply_log = tmp_path / "artifacts/apply/apply_log.json"
+
+    _build_structured_docx_with_fld_simple(source_docx, base_text)
+    _build_add_comment_only_patch(patch_path, base_text)
+    _build_review_units(review_units_path, base_text)
+
+    with zipfile.ZipFile(source_docx, mode="r") as zf:
+        source_document_xml = zf.read("word/document.xml")
+
+    _run_apply(
+        source_docx=source_docx,
+        patch_path=patch_path,
+        review_units_path=review_units_path,
+        output_docx=output_docx,
+        apply_log=apply_log,
+    )
+
+    with zipfile.ZipFile(output_docx, mode="r") as zf:
+        assert zf.testzip() is None, "Output DOCX is not a valid zip package"
+        assert "word/comments.xml" not in set(zf.namelist())
+        output_document_xml = zf.read("word/document.xml")
+        document_root = ET.fromstring(output_document_xml)
+
+    assert document_root.find(".//w:commentRangeStart", NS) is None
+    assert document_root.find(".//w:commentRangeEnd", NS) is None
+    assert document_root.find(".//w:commentReference", NS) is None
+    assert document_root.find(".//w:ins", NS) is None
+    assert document_root.find(".//w:del", NS) is None
+    assert document_root.find(".//w:fldSimple", NS) is not None, "Structured element must remain intact"
+    assert output_document_xml == source_document_xml
+
+    log_payload = json.loads(apply_log.read_text(encoding="utf-8"))
+    assert log_payload["stats"]["input_ops"] == 1
+    assert log_payload["stats"]["applied_ops"] == 0
+    assert log_payload["stats"]["applied_comment_ops"] == 0
+    assert log_payload["stats"]["skipped_ops"] == 1
+    assert log_payload["stats"]["skipped_unsupported_paragraph_structure"] == 1
+
+    op_entry = log_payload["ops"][0]
+    assert op_entry["status"] == "skipped"
+    assert op_entry["reason"] == "unsupported_paragraph_structure"
