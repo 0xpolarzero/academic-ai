@@ -22,6 +22,7 @@ def _run_merge(
     *,
     chunk_results_dir: Path,
     linear_units_path: Path,
+    chunks_manifest_path: Path,
     output_dir: Path,
     author: str = "merge-test",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -33,6 +34,8 @@ def _run_merge(
             str(chunk_results_dir),
             "--linear-units",
             str(linear_units_path),
+            "--chunks-manifest",
+            str(chunks_manifest_path),
             "--output-dir",
             str(output_dir),
             "--author",
@@ -63,13 +66,126 @@ def _target_key(op: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _unit_from_target(target: dict[str, str], *, role: str, editable: bool) -> dict[str, Any]:
+    return {
+        "part": target["part"],
+        "para_id": target["para_id"],
+        "unit_uid": target["unit_uid"],
+        "accepted_text": "",
+        "role": role,
+        "editable": editable,
+        "location": {},
+    }
+
+
+def _write_chunks_manifest(
+    *,
+    chunks_output_dir: Path,
+    chunk_targets: dict[str, dict[str, list[dict[str, str]]]],
+) -> Path:
+    manifest_path = chunks_output_dir / "manifest.json"
+    chunk_entries: list[dict[str, Any]] = []
+
+    for index, chunk_id in enumerate(sorted(chunk_targets.keys()), start=1):
+        definition = chunk_targets[chunk_id]
+        primary = definition.get("primary", [])
+        context_before = definition.get("context_before", [])
+        context_after = definition.get("context_after", [])
+
+        chunk_file_name = f"{chunk_id}.json"
+        chunk_path = chunks_output_dir / chunk_file_name
+        _write_json(
+            chunk_path,
+            {
+                "schema_version": "chunk.v1",
+                "chunk_id": chunk_id,
+                "chunk_index": index - 1,
+                "contract": "primary-only",
+                "primary_units": [_unit_from_target(target, role="primary", editable=True) for target in primary],
+                "context_units_before": [
+                    _unit_from_target(target, role="context_before", editable=False) for target in context_before
+                ],
+                "context_units_after": [
+                    _unit_from_target(target, role="context_after", editable=False) for target in context_after
+                ],
+                "metadata": {},
+            },
+        )
+
+        chunk_entries.append(
+            {
+                "chunk_id": chunk_id,
+                "path": chunk_file_name,
+                "primary_targets": [
+                    {"part": item["part"], "para_id": item["para_id"], "unit_uid": item["unit_uid"]}
+                    for item in primary
+                ],
+                "context_targets_before": [
+                    {"part": item["part"], "para_id": item["para_id"], "unit_uid": item["unit_uid"]}
+                    for item in context_before
+                ],
+                "context_targets_after": [
+                    {"part": item["part"], "para_id": item["para_id"], "unit_uid": item["unit_uid"]}
+                    for item in context_after
+                ],
+            }
+        )
+
+    _write_json(
+        manifest_path,
+        {
+            "schema_version": "chunk_manifest.v1",
+            "generated_at": "2026-02-27T00:00:00Z",
+            "contract": "primary-only",
+            "source": {},
+            "token_budget": {},
+            "unit_count": 0,
+            "chunk_count": len(chunk_entries),
+            "chunks": chunk_entries,
+        },
+    )
+    return manifest_path
+
+
+def _write_linear_units(path: Path, *, targets: list[dict[str, str]]) -> None:
+    _write_json(
+        path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 1,
+            "unit_count": len(targets),
+            "unit_uids": [target["unit_uid"] for target in targets],
+            "units": [target["unit_uid"] for target in targets],
+            "order": [
+                {
+                    "order_index": index,
+                    "part": target["part"],
+                    "part_kind": "body",
+                    "part_name": "document",
+                    "para_id": target["para_id"],
+                    "unit_uid": target["unit_uid"],
+                }
+                for index, target in enumerate(targets)
+            ],
+        },
+    )
+
+
 def test_merge_patch_dedup_conflict_downgrade_and_ordering(tmp_path: Path) -> None:
     chunk_results_dir = tmp_path / "chunk_results"
     output_dir = tmp_path / "patch"
     linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
 
     target_primary = {"part": "word/document.xml", "para_id": "para_z", "unit_uid": "unit_z"}
     target_secondary = {"part": "word/document.xml", "para_id": "para_a", "unit_uid": "unit_a"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={
+            "chunk_0001": {"primary": [target_primary, target_secondary]},
+            "chunk_0002": {"primary": [target_primary]},
+        },
+    )
 
     _write_json(
         chunk_results_dir / "chunk_0001_result.json",
@@ -171,6 +287,7 @@ def test_merge_patch_dedup_conflict_downgrade_and_ordering(tmp_path: Path) -> No
     merged_patch, merge_report = _run_merge(
         chunk_results_dir=chunk_results_dir,
         linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
         output_dir=output_dir,
         author="merge-test",
     )
@@ -240,9 +357,17 @@ def test_merge_patch_conflict_detected_when_unit_uid_missing(tmp_path: Path) -> 
     chunk_results_dir = tmp_path / "chunk_results"
     output_dir = tmp_path / "patch"
     linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
 
     target_with_uid = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
     target_without_uid = {"part": "word/document.xml", "para_id": "para_1"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={
+            "chunk_0001": {"primary": [target_with_uid]},
+            "chunk_0002": {"primary": [target_with_uid]},
+        },
+    )
 
     _write_json(
         chunk_results_dir / "chunk_0001_result.json",
@@ -301,6 +426,7 @@ def test_merge_patch_conflict_detected_when_unit_uid_missing(tmp_path: Path) -> 
     merged_patch, merge_report = _run_merge(
         chunk_results_dir=chunk_results_dir,
         linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
         output_dir=output_dir,
         author="merge-test",
     )
@@ -325,9 +451,17 @@ def test_merge_patch_orders_descending_start_per_para_across_unit_uid_variants(
     chunk_results_dir = tmp_path / "chunk_results"
     output_dir = tmp_path / "patch"
     linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
 
     target_with_uid = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
     target_without_uid = {"part": "word/document.xml", "para_id": "para_1"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={
+            "chunk_0001": {"primary": [target_with_uid]},
+            "chunk_0002": {"primary": [target_with_uid]},
+        },
+    )
 
     _write_json(
         chunk_results_dir / "chunk_0001_result.json",
@@ -385,6 +519,7 @@ def test_merge_patch_orders_descending_start_per_para_across_unit_uid_variants(
     merged_patch, _ = _run_merge(
         chunk_results_dir=chunk_results_dir,
         linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
         output_dir=output_dir,
         author="merge-test",
     )
@@ -395,3 +530,186 @@ def test_merge_patch_orders_descending_start_per_para_across_unit_uid_variants(
         if op["target"].get("part") == "word/document.xml" and op["target"].get("para_id") == "para_1"
     ]
     assert starts == sorted(starts, reverse=True)
+
+
+def test_merge_patch_accepts_primary_target_from_manifest(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    primary_target = {"part": "word/document.xml", "para_id": "para_ok", "unit_uid": "unit_ok"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [primary_target]}},
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": primary_target,
+                    "range": {"start": 0, "end": 4},
+                    "expected": {"snippet": "test"},
+                    "replacement": "TEST",
+                }
+            ],
+        },
+    )
+    _write_linear_units(linear_units_path, targets=[primary_target])
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    assert merge_report["stats"]["ownership_rejected_ops"] == 0
+    assert merge_report["stats"]["ownership_autofilled_unit_uid_ops"] == 0
+    assert len(merged_patch["ops"]) == 1
+    assert _target_key(merged_patch["ops"][0]) == ("word/document.xml", "para_ok", "unit_ok")
+
+
+def test_merge_patch_rejects_context_and_unknown_targets(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    primary_target = {"part": "word/document.xml", "para_id": "para_primary", "unit_uid": "unit_primary"}
+    context_target = {"part": "word/document.xml", "para_id": "para_ctx", "unit_uid": "unit_ctx"}
+    unknown_target = {"part": "word/document.xml", "para_id": "para_unknown", "unit_uid": "unit_unknown"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [primary_target], "context_before": [context_target]}},
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "delete_range",
+                    "target": context_target,
+                    "range": {"start": 1, "end": 3},
+                    "expected": {"snippet": "xx"},
+                },
+                {
+                    "type": "add_comment",
+                    "target": unknown_target,
+                    "range": {"start": 0, "end": 0},
+                    "expected": {"snippet": ""},
+                    "comment_text": "Unknown target should be rejected.",
+                },
+            ],
+        },
+    )
+    _write_linear_units(linear_units_path, targets=[primary_target, context_target, unknown_target])
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    assert merged_patch["ops"] == []
+    assert merge_report["stats"]["ownership_rejected_ops"] == 2
+    assert merge_report["stats"]["ownership_rejected_context_ops"] == 1
+    assert merge_report["stats"]["ownership_rejected_unknown_ops"] == 1
+    rejection_reasons = {item["reason"] for item in merge_report["ownership"]["rejections"]}
+    assert rejection_reasons == {"target_is_context_unit", "target_not_owned_by_chunk"}
+
+
+def test_merge_patch_autofills_missing_unit_uid_for_unique_primary_match(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    primary_target = {"part": "word/document.xml", "para_id": "para_auto", "unit_uid": "unit_auto"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [primary_target]}},
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "add_comment",
+                    "target": {"part": "word/document.xml", "para_id": "para_auto"},
+                    "range": {"start": 0, "end": 4},
+                    "expected": {"snippet": "test"},
+                    "comment_text": "Autofill expected.",
+                }
+            ],
+        },
+    )
+    _write_linear_units(linear_units_path, targets=[primary_target])
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    assert merge_report["stats"]["ownership_autofilled_unit_uid_ops"] == 1
+    assert merge_report["stats"]["ownership_rejected_ops"] == 0
+    assert len(merged_patch["ops"]) == 1
+    assert _target_key(merged_patch["ops"][0]) == ("word/document.xml", "para_auto", "unit_auto")
+
+
+def test_merge_patch_rejects_missing_unit_uid_when_primary_match_is_ambiguous(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    primary_target_one = {"part": "word/document.xml", "para_id": "para_amb", "unit_uid": "unit_amb_1"}
+    primary_target_two = {"part": "word/document.xml", "para_id": "para_amb", "unit_uid": "unit_amb_2"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [primary_target_one, primary_target_two]}},
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": {"part": "word/document.xml", "para_id": "para_amb"},
+                    "range": {"start": 0, "end": 4},
+                    "expected": {"snippet": "test"},
+                    "replacement": "TEST",
+                }
+            ],
+        },
+    )
+    _write_linear_units(linear_units_path, targets=[primary_target_one, primary_target_two])
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    assert merged_patch["ops"] == []
+    assert merge_report["stats"]["ownership_rejected_ops"] == 1
+    assert merge_report["stats"]["ownership_rejected_ambiguous_missing_unit_uid_ops"] == 1
+    assert merge_report["ownership"]["rejections"][0]["reason"] == "missing_unit_uid_ambiguous_primary_match"

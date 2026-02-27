@@ -9,6 +9,7 @@ from pathlib import Path
 from _merge_lib import (
     DEFAULT_AUTHOR,
     DEFAULT_CHUNK_RESULTS_DIR,
+    DEFAULT_CHUNKS_MANIFEST_PATH,
     DEFAULT_LINEAR_UNITS_PATH,
     DEFAULT_OUTPUT_DIR,
     merge_chunk_results_to_artifacts,
@@ -30,6 +31,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional linear_units.json path for document-order sorting",
     )
     parser.add_argument(
+        "--chunks-manifest",
+        type=Path,
+        default=DEFAULT_CHUNKS_MANIFEST_PATH,
+        help="chunks manifest path for primary-only target ownership enforcement",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
@@ -49,6 +56,8 @@ def main() -> int:
 
     if not args.chunk_results_dir.exists():
         parser.error(f"chunk results directory not found: {args.chunk_results_dir}")
+    if not args.chunks_manifest.exists():
+        parser.error(f"chunks manifest not found: {args.chunks_manifest}")
 
     linear_units_path = args.linear_units if args.linear_units.exists() else None
 
@@ -56,6 +65,7 @@ def main() -> int:
         chunk_results_dir=args.chunk_results_dir,
         output_dir=args.output_dir,
         linear_units_path=linear_units_path,
+        chunks_manifest_path=args.chunks_manifest,
         author=str(args.author),
     )
 
@@ -68,6 +78,8 @@ def main() -> int:
         "Ops: "
         f"input={stats['input_ops']} "
         f"valid={stats['valid_ops']} "
+        f"ownership_rejected={stats['ownership_rejected_ops']} "
+        f"autofilled_uid={stats['ownership_autofilled_unit_uid_ops']} "
         f"dedup_removed={stats['duplicates_removed']} "
         f"conflict_downgrades={stats['conflict_downgrades']} "
         f"final={stats['final_ops']}"
@@ -78,4 +90,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

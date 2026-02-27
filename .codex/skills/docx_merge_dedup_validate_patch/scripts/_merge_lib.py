@@ -14,6 +14,7 @@ import unicodedata
 DEFAULT_CHUNK_RESULTS_DIR = Path("artifacts/chunk_results")
 DEFAULT_OUTPUT_DIR = Path("artifacts/patch")
 DEFAULT_LINEAR_UNITS_PATH = Path("artifacts/docx_extract/linear_units.json")
+DEFAULT_CHUNKS_MANIFEST_PATH = Path("artifacts/chunks/manifest.json")
 DEFAULT_AUTHOR = "docx_merge_dedup_validate_patch"
 
 PATCH_SCHEMA_VERSION = "patch.v1"
@@ -21,6 +22,9 @@ MERGE_REPORT_SCHEMA_VERSION = "merge_report.v1"
 
 VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at", "delete_range"}
 EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
+
+TargetKey = tuple[str, str, str]
+ParaKey = tuple[str, str]
 
 
 def _now_iso() -> str:
@@ -89,6 +93,49 @@ def _normalize_expected(raw_expected: Any) -> dict[str, str]:
     if not isinstance(raw_expected, dict):
         raw_expected = {}
     return {"snippet": str(raw_expected.get("snippet", ""))}
+
+
+def _normalize_target_key(raw_target: Any) -> TargetKey | None:
+    if not isinstance(raw_target, dict):
+        return None
+
+    part = str(raw_target.get("part", "")).strip()
+    para_id = str(raw_target.get("para_id", "")).strip()
+    unit_uid = str(raw_target.get("unit_uid", "")).strip()
+    if not part or not para_id or not unit_uid:
+        return None
+    return (part, para_id, unit_uid)
+
+
+def _add_target_to_para_index(
+    index: dict[ParaKey, set[str]],
+    *,
+    target: TargetKey,
+) -> None:
+    part, para_id, unit_uid = target
+    index.setdefault((part, para_id), set()).add(unit_uid)
+
+
+def _targets_from_unit_list(raw_units: Any) -> set[TargetKey]:
+    if not isinstance(raw_units, list):
+        return set()
+    targets: set[TargetKey] = set()
+    for raw_unit in raw_units:
+        target = _normalize_target_key(raw_unit)
+        if target is not None:
+            targets.add(target)
+    return targets
+
+
+def _targets_from_target_list(raw_targets: Any) -> set[TargetKey]:
+    if not isinstance(raw_targets, list):
+        return set()
+    targets: set[TargetKey] = set()
+    for raw_target in raw_targets:
+        target = _normalize_target_key(raw_target)
+        if target is not None:
+            targets.add(target)
+    return targets
 
 
 def _dedup_key(op: dict[str, Any]) -> str:
@@ -330,17 +377,212 @@ def _count_ops_by_type(ops: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def _load_chunk_ownership_index(
+    chunks_manifest_path: Path | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if chunks_manifest_path is None:
+        return {}, {"enabled": False, "chunks_manifest_path": None, "chunks_indexed": 0, "manifest_chunk_entries": 0}
+
+    if not chunks_manifest_path.exists():
+        raise FileNotFoundError(f"chunks manifest not found: {chunks_manifest_path}")
+
+    manifest_payload = load_json(chunks_manifest_path)
+    if not isinstance(manifest_payload, dict):
+        raise ValueError("chunks manifest payload must be an object")
+
+    raw_chunks = manifest_payload.get("chunks", [])
+    if not isinstance(raw_chunks, list):
+        raise ValueError("chunks manifest must include a list at chunks")
+
+    manifest_dir = chunks_manifest_path.parent
+    ownership_index: dict[str, dict[str, Any]] = {}
+
+    for entry in raw_chunks:
+        if not isinstance(entry, dict):
+            continue
+
+        chunk_id = str(entry.get("chunk_id", "")).strip()
+        if not chunk_id:
+            continue
+
+        primary_targets = _targets_from_target_list(entry.get("primary_targets"))
+        context_targets = _targets_from_target_list(entry.get("context_targets_before")) | _targets_from_target_list(
+            entry.get("context_targets_after")
+        )
+
+        chunk_file_name = str(entry.get("path", "")).strip()
+        chunk_payload: dict[str, Any] | None = None
+        if chunk_file_name:
+            chunk_path = manifest_dir / chunk_file_name
+            if chunk_path.exists():
+                loaded = load_json(chunk_path)
+                if not isinstance(loaded, dict):
+                    raise ValueError(f"chunk payload must be an object: {chunk_path}")
+                chunk_payload = loaded
+            elif not primary_targets and not context_targets:
+                raise FileNotFoundError(f"chunk file not found for {chunk_id}: {chunk_path}")
+
+        if chunk_payload is not None:
+            if not primary_targets:
+                primary_targets |= _targets_from_unit_list(chunk_payload.get("primary_units"))
+            if not context_targets:
+                context_targets |= _targets_from_unit_list(chunk_payload.get("context_units_before"))
+                context_targets |= _targets_from_unit_list(chunk_payload.get("context_units_after"))
+
+            if not primary_targets:
+                primary_targets |= _targets_from_target_list(chunk_payload.get("primary_targets"))
+            if not context_targets:
+                context_targets |= _targets_from_target_list(chunk_payload.get("context_targets_before"))
+                context_targets |= _targets_from_target_list(chunk_payload.get("context_targets_after"))
+
+        context_targets -= primary_targets
+
+        primary_by_para: dict[ParaKey, set[str]] = {}
+        context_by_para: dict[ParaKey, set[str]] = {}
+        for target in primary_targets:
+            _add_target_to_para_index(primary_by_para, target=target)
+        for target in context_targets:
+            _add_target_to_para_index(context_by_para, target=target)
+
+        ownership_index[chunk_id] = {
+            "primary_targets": primary_targets,
+            "context_targets": context_targets,
+            "primary_by_para": primary_by_para,
+            "context_by_para": context_by_para,
+        }
+
+    return ownership_index, {
+        "enabled": True,
+        "chunks_manifest_path": str(chunks_manifest_path),
+        "chunks_indexed": len(ownership_index),
+        "manifest_chunk_entries": len(raw_chunks),
+    }
+
+
+def _enforce_op_target_ownership(
+    *,
+    op: dict[str, Any],
+    chunk_id: str,
+    ownership_index: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    ownership = ownership_index.get(chunk_id)
+    target_part, target_para_id, target_unit_uid = _target_key(op)
+    source = _source_ref(op)
+
+    if ownership is None:
+        return (
+            None,
+            {
+                "reason": "chunk_not_found_in_manifest",
+                "chunk_id": chunk_id,
+                "target": op["target"],
+                "source": source,
+            },
+            None,
+        )
+
+    if target_unit_uid:
+        candidate = (target_part, target_para_id, target_unit_uid)
+        if candidate in ownership["primary_targets"]:
+            return op, None, None
+        if candidate in ownership["context_targets"]:
+            return (
+                None,
+                {
+                    "reason": "target_is_context_unit",
+                    "chunk_id": chunk_id,
+                    "target": op["target"],
+                    "source": source,
+                },
+                None,
+            )
+        return (
+            None,
+            {
+                "reason": "target_not_owned_by_chunk",
+                "chunk_id": chunk_id,
+                "target": op["target"],
+                "source": source,
+            },
+            None,
+        )
+
+    para_key = (target_part, target_para_id)
+    primary_candidates = sorted(ownership["primary_by_para"].get(para_key, set()))
+    if len(primary_candidates) == 1:
+        filled_unit_uid = primary_candidates[0]
+        rewritten = dict(op)
+        rewritten_target = dict(op["target"])
+        rewritten_target["unit_uid"] = filled_unit_uid
+        rewritten["target"] = rewritten_target
+        rewritten["dedup_key"] = _dedup_key(rewritten)
+        return (
+            rewritten,
+            None,
+            {
+                "chunk_id": chunk_id,
+                "source": source,
+                "target_before": op["target"],
+                "target_after": rewritten_target,
+                "reason": "missing_unit_uid_autofilled_from_unique_primary_match",
+            },
+        )
+
+    if len(primary_candidates) > 1:
+        return (
+            None,
+            {
+                "reason": "missing_unit_uid_ambiguous_primary_match",
+                "chunk_id": chunk_id,
+                "target": op["target"],
+                "candidate_unit_uids": primary_candidates,
+                "source": source,
+            },
+            None,
+        )
+
+    context_candidates = sorted(ownership["context_by_para"].get(para_key, set()))
+    if context_candidates:
+        return (
+            None,
+            {
+                "reason": "target_is_context_unit",
+                "chunk_id": chunk_id,
+                "target": op["target"],
+                "candidate_unit_uids": context_candidates,
+                "source": source,
+            },
+            None,
+        )
+
+    return (
+        None,
+        {
+            "reason": "target_not_owned_by_chunk",
+            "chunk_id": chunk_id,
+            "target": op["target"],
+            "source": source,
+        },
+        None,
+    )
+
+
 def merge_chunk_results_to_artifacts(
     *,
     chunk_results_dir: Path,
     output_dir: Path,
     linear_units_path: Path | None = DEFAULT_LINEAR_UNITS_PATH,
+    chunks_manifest_path: Path | None = DEFAULT_CHUNKS_MANIFEST_PATH,
     author: str = DEFAULT_AUTHOR,
 ) -> dict[str, Any]:
     chunk_files = sorted(chunk_results_dir.glob("chunk_*_result.json"))
 
+    ownership_index, ownership_meta = _load_chunk_ownership_index(chunks_manifest_path)
+
     normalized_ops: list[dict[str, Any]] = []
     invalid_ops: list[dict[str, Any]] = []
+    ownership_rejections: list[dict[str, Any]] = []
+    ownership_autofills: list[dict[str, Any]] = []
     raw_input_op_count = 0
     sequence = 0
 
@@ -405,6 +647,41 @@ def merge_chunk_results_to_artifacts(
                     }
                 )
                 continue
+
+            if ownership_meta.get("enabled"):
+                normalized, ownership_rejection, ownership_autofill = _enforce_op_target_ownership(
+                    op=normalized,
+                    chunk_id=chunk_id,
+                    ownership_index=ownership_index,
+                )
+                if ownership_rejection is not None:
+                    ownership_rejections.append(ownership_rejection)
+                    invalid_ops.append(
+                        {
+                            "source_file": str(chunk_file),
+                            "chunk_id": chunk_id,
+                            "op_index": op_index,
+                            "reason": str(ownership_rejection.get("reason", "ownership_enforcement_rejected")),
+                            "stage": "ownership_enforcement",
+                            "target": ownership_rejection.get("target"),
+                        }
+                    )
+                    continue
+
+                if normalized is None:
+                    invalid_ops.append(
+                        {
+                            "source_file": str(chunk_file),
+                            "chunk_id": chunk_id,
+                            "op_index": op_index,
+                            "reason": "ownership_enforcement_rejected",
+                            "stage": "ownership_enforcement",
+                        }
+                    )
+                    continue
+
+                if ownership_autofill is not None:
+                    ownership_autofills.append(ownership_autofill)
 
             normalized_ops.append(normalized)
             sequence += 1
@@ -507,17 +784,38 @@ def merge_chunk_results_to_artifacts(
             "chunk_files": [path.name for path in chunk_files],
             "linear_units_path": str(linear_units_path) if linear_units_path is not None else None,
             "used_linear_order": used_linear_order,
+            "chunks_manifest_path": ownership_meta.get("chunks_manifest_path"),
+            "ownership_enforced": bool(ownership_meta.get("enabled")),
+            "manifest_chunk_entries": ownership_meta.get("manifest_chunk_entries", 0),
+            "chunks_indexed": ownership_meta.get("chunks_indexed", 0),
         },
         "stats": {
             "chunk_file_count": len(chunk_files),
             "input_ops": raw_input_op_count,
             "valid_ops": len(normalized_ops),
             "invalid_ops": len(invalid_ops),
+            "ownership_rejected_ops": len(ownership_rejections),
+            "ownership_rejected_context_ops": sum(
+                1 for item in ownership_rejections if item.get("reason") == "target_is_context_unit"
+            ),
+            "ownership_rejected_unknown_ops": sum(
+                1
+                for item in ownership_rejections
+                if item.get("reason") in {"target_not_owned_by_chunk", "chunk_not_found_in_manifest"}
+            ),
+            "ownership_rejected_ambiguous_missing_unit_uid_ops": sum(
+                1 for item in ownership_rejections if item.get("reason") == "missing_unit_uid_ambiguous_primary_match"
+            ),
+            "ownership_autofilled_unit_uid_ops": len(ownership_autofills),
             "duplicates_removed": len(duplicate_ops),
             "ops_after_dedup": len(deduped_ops),
             "conflict_downgrades": len(conflicts),
             "final_ops": len(resolved_ops),
             "final_ops_by_type": _count_ops_by_type(resolved_ops),
+        },
+        "ownership": {
+            "rejections": ownership_rejections,
+            "autofills": ownership_autofills,
         },
         "duplicates": duplicate_ops,
         "conflicts": conflicts,
