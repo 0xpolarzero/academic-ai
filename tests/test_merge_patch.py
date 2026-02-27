@@ -317,3 +317,81 @@ def test_merge_patch_conflict_detected_when_unit_uid_missing(tmp_path: Path) -> 
     assert "Conflict downgrade" in downgraded["comment_text"]
     assert "replacement" not in downgraded
     assert "new_text" not in downgraded
+
+
+def test_merge_patch_orders_descending_start_per_para_across_unit_uid_variants(
+    tmp_path: Path,
+) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+
+    target_with_uid = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
+    target_without_uid = {"part": "word/document.xml", "para_id": "para_1"}
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": target_with_uid,
+                    "range": {"start": 10, "end": 12},
+                    "expected": {"snippet": "aa"},
+                    "replacement": "AA",
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0002_result.json",
+        {
+            "chunk_id": "chunk_0002",
+            "ops": [
+                {
+                    "type": "add_comment",
+                    "target": target_without_uid,
+                    "range": {"start": 40, "end": 40},
+                    "expected": {"snippet": ""},
+                    "comment_text": "High-offset para-level note.",
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        linear_units_path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 1,
+            "unit_count": 1,
+            "unit_uids": ["unit_1"],
+            "units": ["unit_1"],
+            "order": [
+                {
+                    "order_index": 0,
+                    "part": "word/document.xml",
+                    "part_kind": "body",
+                    "part_name": "document",
+                    "para_id": "para_1",
+                    "unit_uid": "unit_1",
+                }
+            ],
+        },
+    )
+
+    merged_patch, _ = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    starts = [
+        op["range"]["start"]
+        for op in merged_patch["ops"]
+        if op["target"].get("part") == "word/document.xml" and op["target"].get("para_id") == "para_1"
+    ]
+    assert starts == sorted(starts, reverse=True)

@@ -483,9 +483,10 @@ def merge_chunk_results_to_artifacts(
     resolved_ops.sort(
         key=lambda op: (
             _doc_order_index(op, order_by_unit, order_by_para),
-            _target_key(op),
+            _target_para_key(op),
             -op["range"]["start"],
             -op["range"]["end"],
+            _target_key(op),
             op["_sequence"],
         )
     )
