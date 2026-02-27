@@ -744,9 +744,9 @@ def _sanitize_chunk_result_ops(
         sanitized_ops.append(sanitized)
         kept += 1
 
-    suggestions = raw_payload.get("suggestions", [])
-    if not isinstance(suggestions, list):
-        suggestions = []
+    # Do not propagate free-text status/progress chatter into saved results.
+    # Keep runner-owned suggestion output deterministic and empty.
+    suggestions: list[str] = []
 
     sanitized_payload = {
         "schema_version": "chunk_result.v1",
@@ -754,7 +754,7 @@ def _sanitize_chunk_result_ops(
         "status": "ok",
         "summary": "Chunk result sanitized by runner ownership and shape checks.",
         "ops": sanitized_ops,
-        "suggestions": [str(item) for item in suggestions if isinstance(item, str)],
+        "suggestions": suggestions,
     }
 
     log_payload = {
