@@ -6,6 +6,12 @@ __pycache__/
 artifacts/
 input/
 output/
+projects/**/input/
+projects/**/artifacts/
+projects/**/output/
+!projects/**/input/.gitkeep
+!projects/**/artifacts/.gitkeep
+!projects/**/output/.gitkeep
 
 fixtures/*.docx
 

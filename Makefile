@@ -12,7 +12,7 @@ MERGE_SCRIPT := .codex/skills/docx_merge_dedup_validate_patch/scripts/merge_patc
 APPLY_SCRIPT := .codex/skills/docx_apply_patch_to_output/scripts/apply_docx_patch.py
 REPORT_SCRIPT := .codex/skills/docx_change_report_before_after/scripts/change_report.py
 
-.PHONY: help fixtures extract chunk merge apply report test e2e clean
+.PHONY: help fixtures extract chunk merge apply report test e2e clean project run
 
 help:
 	@echo "Pipeline targets"
@@ -22,8 +22,30 @@ help:
 	@echo "  make merge     # synthetic chunk_results -> artifacts/patch"
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
 	@echo "  make report    # patch/apply -> output/changes.{md,json}"
+	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
+	@echo "  make run PROJECT=<slug> WORKFLOW=<name>     # run project workflow (runner in phase3)"
 	@echo "  make test      # pytest unit + integration checks"
 	@echo "  make e2e       # extract->chunk->synthetic->merge->apply->report"
+
+project:
+	@test -n "$(PROJECT)" || (echo "Usage: make project PROJECT=<slug>" && exit 2)
+	@mkdir -p "projects/$(PROJECT)/input" "projects/$(PROJECT)/workflows" "projects/$(PROJECT)/artifacts" "projects/$(PROJECT)/output"
+	@touch "projects/$(PROJECT)/input/.gitkeep" "projects/$(PROJECT)/artifacts/.gitkeep" "projects/$(PROJECT)/output/.gitkeep"
+	@if [ -f "projects/thesis/workflows/fr_copyedit_conservative.xml" ] && [ ! -f "projects/$(PROJECT)/workflows/fr_copyedit_conservative.xml" ]; then \
+		cp "projects/thesis/workflows/fr_copyedit_conservative.xml" "projects/$(PROJECT)/workflows/fr_copyedit_conservative.xml"; \
+	fi
+	@if [ -f "projects/thesis/workflows/fr_copyedit_micro.xml" ] && [ ! -f "projects/$(PROJECT)/workflows/fr_copyedit_micro.xml" ]; then \
+		cp "projects/thesis/workflows/fr_copyedit_micro.xml" "projects/$(PROJECT)/workflows/fr_copyedit_micro.xml"; \
+	fi
+	@echo "Scaffolded projects/$(PROJECT)"
+
+run:
+	@test -n "$(PROJECT)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name>" && exit 2)
+	@test -n "$(WORKFLOW)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name>" && exit 2)
+	@test -d "projects/$(PROJECT)" || (echo "Missing project directory: projects/$(PROJECT)" && exit 2)
+	@test -f "projects/$(PROJECT)/workflows/$(WORKFLOW).xml" || (echo "Missing workflow file: projects/$(PROJECT)/workflows/$(WORKFLOW).xml" && exit 2)
+	@test -f "scripts/run_project.py" || (echo "Runner not implemented yet: scripts/run_project.py (planned in phase3)" && exit 2)
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)"
 
 fixtures:
 	@mkdir -p fixtures

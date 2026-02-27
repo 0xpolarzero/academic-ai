@@ -1,0 +1,24 @@
+<workflow name="fr_copyedit_micro" version="1">
+  <locale>fr-FR</locale>
+  <profile>copyedit</profile>
+  <pass>secondary</pass>
+  <policy>
+    <meaning_preservation>strict</meaning_preservation>
+    <rephrase_if_obscure_only>false</rephrase_if_obscure_only>
+    <micro_clarity_rephrase_allowed>true</micro_clarity_rephrase_allowed>
+    <redo_copyedit_tasks>false</redo_copyedit_tasks>
+  </policy>
+  <operations>
+    <grammar>false</grammar>
+    <agreement>false</agreement>
+    <spelling>false</spelling>
+    <punctuation>false</punctuation>
+    <typography>false</typography>
+    <micro_clarity>true</micro_clarity>
+  </operations>
+  <constraints>
+    <minimal_edits>true</minimal_edits>
+    <no_tone_shift>true</no_tone_shift>
+    <no_structural_rewrite>true</no_structural_rewrite>
+  </constraints>
+</workflow>
