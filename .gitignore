@@ -1,5 +1,1 @@
-input/*
-!input/.gitkeep
-artifacts/
-
-.DS_STORE
+.DS_Store
