@@ -14,7 +14,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["type", "target", "expected"],
         "properties": {
           "type": {
@@ -24,7 +24,7 @@
           "target": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["part", "para_id"],
+            "required": ["part", "para_id", "unit_uid"],
             "properties": {
               "part": { "type": "string", "minLength": 1 },
               "para_id": { "type": "string", "minLength": 1 },
@@ -47,8 +47,25 @@
             "properties": {
               "snippet": { "type": "string" }
             }
+          },
+          "replacement": { "type": "string" },
+          "new_text": { "type": "string" },
+          "comment_text": { "type": "string", "minLength": 1 }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "type": { "const": "replace_range" } }, "required": ["type"] },
+            "then": { "required": ["replacement"] }
+          },
+          {
+            "if": { "properties": { "type": { "const": "insert_at" } }, "required": ["type"] },
+            "then": { "required": ["new_text"] }
+          },
+          {
+            "if": { "properties": { "type": { "const": "add_comment" } }, "required": ["type"] },
+            "then": { "required": ["comment_text"] }
           }
-        }
+        ]
       }
     }
   }

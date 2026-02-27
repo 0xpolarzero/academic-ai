@@ -89,10 +89,48 @@ def _normalize_range(raw_range: Any, *, op_type: str) -> dict[str, int]:
     return {"start": start, "end": end}
 
 
+def _normalize_optional_range(raw_range: Any, *, op_type: str) -> dict[str, int] | None:
+    if raw_range is None:
+        return None
+    return _normalize_range(raw_range, op_type=op_type)
+
+
 def _normalize_expected(raw_expected: Any) -> dict[str, str]:
     if not isinstance(raw_expected, dict):
         raw_expected = {}
     return {"snippet": str(raw_expected.get("snippet", ""))}
+
+
+def _utf16_offsets(text: str) -> list[int]:
+    offsets = [0]
+    total = 0
+    for char in text:
+        total += len(char.encode("utf-16-le")) // 2
+        offsets.append(total)
+    return offsets
+
+
+def _cp_to_u16(offsets: list[int], cp_index: int) -> int:
+    if cp_index < 0:
+        return 0
+    if cp_index >= len(offsets):
+        return offsets[-1]
+    return offsets[cp_index]
+
+
+def _all_occurrences(haystack: str, needle: str) -> list[tuple[int, int]]:
+    if not needle:
+        return []
+    occurrences: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = haystack.find(needle, cursor)
+        if start < 0:
+            break
+        end = start + len(needle)
+        occurrences.append((start, end))
+        cursor = start + 1
+    return occurrences
 
 
 def _normalize_target_key(raw_target: Any) -> TargetKey | None:
@@ -142,7 +180,7 @@ def _dedup_key(op: dict[str, Any]) -> str:
     payload = {
         "type": op["type"],
         "target": op["target"],
-        "range": op["range"],
+        "range": op.get("range"),
         "old": _normalize_text(op["expected"].get("snippet")),
         "new": _normalize_text(op.get("replacement") or op.get("new_text")),
         "comment": _normalize_text(op.get("comment_text")),
@@ -169,10 +207,14 @@ def _target_para_key(op: dict[str, Any]) -> tuple[str, str]:
 
 
 def _same_range(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if left.get("range") is None or right.get("range") is None:
+        return False
     return left["range"]["start"] == right["range"]["start"] and left["range"]["end"] == right["range"]["end"]
 
 
 def _ranges_overlap_for_edits(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if left.get("range") is None or right.get("range") is None:
+        return False
     left_start = left["range"]["start"]
     left_end = left["range"]["end"]
     right_start = right["range"]["start"]
@@ -275,7 +317,7 @@ def _normalize_raw_op(
     normalized: dict[str, Any] = {
         "type": op_type,
         "target": _normalize_target(raw_op.get("target")),
-        "range": _normalize_range(raw_op.get("range"), op_type=op_type),
+        "range": _normalize_optional_range(raw_op.get("range"), op_type=op_type),
         "expected": _normalize_expected(raw_op.get("expected")),
         "_source": {
             "chunk_id": chunk_id,
@@ -350,6 +392,8 @@ def _doc_order_index(
 
 
 def _to_output_op(op: dict[str, Any]) -> dict[str, Any]:
+    if op.get("range") is None:
+        raise ValueError("final patch op is missing range")
     output = {
         "type": op["type"],
         "target": op["target"],
@@ -366,6 +410,128 @@ def _to_output_op(op: dict[str, Any]) -> dict[str, Any]:
     if "category" in op:
         output["category"] = op["category"]
     return output
+
+
+def _build_review_unit_text_index(
+    review_units_path: Path | None,
+) -> tuple[dict[tuple[str, str, str], str], dict[tuple[str, str], str]]:
+    if review_units_path is None or not review_units_path.exists():
+        return {}, {}
+
+    payload = load_json(review_units_path)
+    raw_units = payload.get("units", [])
+    if not isinstance(raw_units, list):
+        return {}, {}
+
+    by_exact: dict[tuple[str, str, str], str] = {}
+    by_para: dict[tuple[str, str], str] = {}
+    for unit in raw_units:
+        if not isinstance(unit, dict):
+            continue
+        part = str(unit.get("part", "")).strip()
+        para_id = str(unit.get("para_id", "")).strip()
+        unit_uid = str(unit.get("unit_uid", "")).strip()
+        accepted_text = str(unit.get("accepted_text", ""))
+        if not part or not para_id:
+            continue
+        by_para.setdefault((part, para_id), accepted_text)
+        if unit_uid:
+            by_exact[(part, para_id, unit_uid)] = accepted_text
+    return by_exact, by_para
+
+
+def _resolve_missing_ranges(
+    *,
+    ops: list[dict[str, Any]],
+    review_units_path: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    by_exact, by_para = _build_review_unit_text_index(review_units_path)
+    resolved_ops: list[dict[str, Any]] = []
+    range_resolution: list[dict[str, Any]] = []
+    invalid_ops: list[dict[str, Any]] = []
+
+    for op in ops:
+        if op.get("range") is not None:
+            resolved_ops.append(op)
+            continue
+
+        target = op.get("target", {})
+        part = str(target.get("part", "")).strip()
+        para_id = str(target.get("para_id", "")).strip()
+        unit_uid = str(target.get("unit_uid", "")).strip()
+        snippet = str(op.get("expected", {}).get("snippet", ""))
+
+        accepted_text = ""
+        if part and para_id and unit_uid and (part, para_id, unit_uid) in by_exact:
+            accepted_text = by_exact[(part, para_id, unit_uid)]
+        elif part and para_id and (part, para_id) in by_para:
+            accepted_text = by_para[(part, para_id)]
+
+        if not accepted_text or not snippet:
+            invalid_ops.append(
+                {
+                    "source_file": op.get("_source", {}).get("source_file"),
+                    "chunk_id": op.get("_source", {}).get("chunk_id"),
+                    "op_index": op.get("_source", {}).get("op_index"),
+                    "reason": "range_resolution_missing_target_or_snippet",
+                }
+            )
+            continue
+
+        occurrences = _all_occurrences(accepted_text, snippet)
+        if not occurrences:
+            invalid_ops.append(
+                {
+                    "source_file": op.get("_source", {}).get("source_file"),
+                    "chunk_id": op.get("_source", {}).get("chunk_id"),
+                    "op_index": op.get("_source", {}).get("op_index"),
+                    "reason": "range_resolution_snippet_not_found",
+                }
+            )
+            continue
+
+        if len(occurrences) > 1:
+            # Never guess location for ambiguous snippets; downgrade deterministically.
+            downgraded = dict(op)
+            downgraded["type"] = "add_comment"
+            downgraded["range"] = {"start": 0, "end": 0}
+            downgraded["comment_text"] = (
+                f"Range resolution ambiguous for snippet: {snippet!r}. Review manually."
+            )
+            downgraded.pop("replacement", None)
+            downgraded.pop("new_text", None)
+            downgraded["dedup_key"] = _dedup_key(downgraded)
+            resolved_ops.append(downgraded)
+            range_resolution.append(
+                {
+                    "action": "downgrade_to_comment",
+                    "reason": "range_resolution_ambiguous_snippet",
+                    "source": _source_ref(op),
+                }
+            )
+            continue
+
+        cp_start, cp_end = occurrences[0]
+        offsets = _utf16_offsets(accepted_text)
+        start_u16 = _cp_to_u16(offsets, cp_start)
+        end_u16 = _cp_to_u16(offsets, cp_end)
+
+        rewritten = dict(op)
+        if rewritten["type"] == "insert_at":
+            rewritten["range"] = {"start": end_u16, "end": end_u16}
+        else:
+            rewritten["range"] = {"start": start_u16, "end": end_u16}
+        rewritten["dedup_key"] = _dedup_key(rewritten)
+        resolved_ops.append(rewritten)
+        range_resolution.append(
+            {
+                "action": "resolved_range_from_snippet",
+                "source": _source_ref(op),
+                "range": rewritten["range"],
+            }
+        )
+
+    return resolved_ops, range_resolution, invalid_ops
 
 
 def _count_ops_by_type(ops: list[dict[str, Any]]) -> dict[str, int]:
@@ -573,6 +739,7 @@ def merge_chunk_results_to_artifacts(
     output_dir: Path,
     linear_units_path: Path | None = DEFAULT_LINEAR_UNITS_PATH,
     chunks_manifest_path: Path | None = DEFAULT_CHUNKS_MANIFEST_PATH,
+    review_units_path: Path | None = None,
     author: str = DEFAULT_AUTHOR,
 ) -> dict[str, Any]:
     chunk_files = sorted(chunk_results_dir.glob("chunk_*_result.json"))
@@ -686,6 +853,12 @@ def merge_chunk_results_to_artifacts(
             normalized_ops.append(normalized)
             sequence += 1
 
+    normalized_ops, range_resolution, range_invalid_ops = _resolve_missing_ranges(
+        ops=normalized_ops,
+        review_units_path=review_units_path,
+    )
+    invalid_ops.extend(range_invalid_ops)
+
     deduped_ops: list[dict[str, Any]] = []
     seen_keys: dict[str, dict[str, Any]] = {}
     duplicate_ops: list[dict[str, Any]] = []
@@ -785,6 +958,7 @@ def merge_chunk_results_to_artifacts(
             "linear_units_path": str(linear_units_path) if linear_units_path is not None else None,
             "used_linear_order": used_linear_order,
             "chunks_manifest_path": ownership_meta.get("chunks_manifest_path"),
+            "review_units_path": str(review_units_path) if review_units_path is not None else None,
             "ownership_enforced": bool(ownership_meta.get("enabled")),
             "manifest_chunk_entries": ownership_meta.get("manifest_chunk_entries", 0),
             "chunks_indexed": ownership_meta.get("chunks_indexed", 0),
@@ -809,6 +983,7 @@ def merge_chunk_results_to_artifacts(
             "ownership_autofilled_unit_uid_ops": len(ownership_autofills),
             "duplicates_removed": len(duplicate_ops),
             "ops_after_dedup": len(deduped_ops),
+            "range_resolution_events": len(range_resolution),
             "conflict_downgrades": len(conflicts),
             "final_ops": len(resolved_ops),
             "final_ops_by_type": _count_ops_by_type(resolved_ops),
@@ -819,6 +994,7 @@ def merge_chunk_results_to_artifacts(
         },
         "duplicates": duplicate_ops,
         "conflicts": conflicts,
+        "range_resolution": range_resolution,
         "invalid_ops": invalid_ops,
     }
 

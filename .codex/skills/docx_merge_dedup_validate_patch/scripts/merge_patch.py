@@ -14,6 +14,7 @@ from _merge_lib import (
 DEFAULT_CHUNK_RESULTS_DIR = Path("artifacts/chunk_results")
 DEFAULT_LINEAR_UNITS_PATH = Path("artifacts/docx_extract/linear_units.json")
 DEFAULT_CHUNKS_MANIFEST_PATH = Path("artifacts/chunks/manifest.json")
+DEFAULT_REVIEW_UNITS_PATH = Path("artifacts/docx_extract/review_units.json")
 DEFAULT_OUTPUT_DIR = Path("artifacts/patch")
 
 
@@ -42,6 +43,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_CHUNKS_MANIFEST_PATH,
         help="chunks manifest path for primary-only target ownership enforcement",
+    )
+    parser.add_argument(
+        "--review-units",
+        type=Path,
+        default=DEFAULT_REVIEW_UNITS_PATH,
+        help="Optional review_units.json path for resolving ops with missing ranges",
     )
     parser.add_argument(
         "--output-dir",
@@ -76,12 +83,16 @@ def main() -> int:
         parser.error(f"chunks manifest not found: {chunks_manifest}")
 
     linear_units_path = linear_units if linear_units.exists() else None
+    review_units_path = _resolve_project_path(project_dir, args.review_units)
+    if not review_units_path.exists():
+        review_units_path = None
 
     result = merge_chunk_results_to_artifacts(
         chunk_results_dir=chunk_results_dir,
         output_dir=output_dir,
         linear_units_path=linear_units_path,
         chunks_manifest_path=chunks_manifest,
+        review_units_path=review_units_path,
         author=str(args.author),
     )
 

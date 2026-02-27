@@ -10,18 +10,6 @@
     <rule>Use fixes only when strictly necessary.</rule>
   </rules>
   <output_contract>
-    <status>ok|needs_fix</status>
-    <issues>list of short strings</issues>
-    <fixes>
-      <merge_adjacent>
-        <left_chunk_id>chunk id</left_chunk_id>
-        <right_chunk_id>chunk id</right_chunk_id>
-      </merge_adjacent>
-      <shift_boundary>
-        <left_chunk_id>chunk id</left_chunk_id>
-        <right_chunk_id>chunk id</right_chunk_id>
-        <move_primary_units>int (positive moves right to left; negative moves left to right)</move_primary_units>
-      </shift_boundary>
-    </fixes>
+    <json_object>{"status":"ok|needs_fix","issues":["..."],"fixes":[{"type":"merge_adjacent","left_chunk_id":"...","right_chunk_id":"..."},{"type":"shift_boundary","left_chunk_id":"...","right_chunk_id":"...","move_primary_units":1}]}</json_object>
   </output_contract>
 </chunk_qa_prompt>

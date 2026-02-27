@@ -10,7 +10,6 @@
     <rule>Do not add new edit operations.</rule>
   </rules>
   <output_contract>
-    <action>drop_op by op_id or op_index</action>
-    <action>downgrade_to_comment by op_id or op_index with comment_text</action>
+    <json_object>{"actions":[{"type":"drop_op","op_index":0},{"type":"downgrade_to_comment","op_index":1,"comment_text":"..."}],"notes":["..."]}</json_object>
   </output_contract>
 </merge_qa_prompt>

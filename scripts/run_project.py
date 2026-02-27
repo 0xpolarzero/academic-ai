@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Run project workflow pipeline with dry-run synthetic chunk results support."""
+"""Run project workflow pipeline with dry-run and Codex-integrated review support."""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import itertools
+import copy
 from pathlib import Path
 import json
 import re
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +26,17 @@ APPLY_SCRIPT = REPO_ROOT / ".codex/skills/docx_apply_patch_to_output/scripts/app
 REPORT_SCRIPT = REPO_ROOT / ".codex/skills/docx_change_report_before_after/scripts/change_report.py"
 VALIDATE_SCRIPT = REPO_ROOT / "scripts/validate_dry_run_outputs.py"
 
+TEMPLATE_CHUNK_QA = REPO_ROOT / "templates/chunk_qa.xml"
+TEMPLATE_CHUNK_REVIEW = REPO_ROOT / "templates/chunk_review.xml"
+TEMPLATE_MERGE_QA = REPO_ROOT / "templates/merge_qa.xml"
+
+SCHEMA_CHUNK_QA = REPO_ROOT / "schemas/chunk_qa.schema.json"
+SCHEMA_CHUNK_REVIEW = REPO_ROOT / "schemas/chunk_result.schema.json"
+SCHEMA_MERGE_QA = REPO_ROOT / "schemas/merge_qa.schema.json"
+
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
+VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at", "delete_range"}
+EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
 
 
 @dataclass(frozen=True)
@@ -38,6 +51,11 @@ class ProjectPaths:
     patch_output_dir: Path
     merged_patch: Path
     merge_report: Path
+    final_patch: Path
+    chunk_qa_report: Path
+    merge_qa_report: Path
+    final_patch_overrides: Path
+    chunk_result_sanitization_log: Path
     apply_log: Path
     annotated_docx: Path
     changes_md: Path
@@ -56,7 +74,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", required=True, help="Project slug under projects/")
     parser.add_argument("--workflow", required=True, help="Workflow name in projects/<project>/workflows/<name>.xml")
     parser.add_argument("--constants", type=Path, default=Path("config/constants.json"), help="Path to constants JSON")
-    parser.add_argument("--author", default="phase3-runner", help="Author value used in merge/apply artifacts")
+    parser.add_argument("--author", default="phase4-runner", help="Author value used in merge/apply artifacts")
+    parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk Codex reviewers")
     parser.add_argument("--dry-run", action="store_true", help="Generate synthetic chunk results instead of model outputs")
     parser.add_argument("--skip-validation", action="store_true", help="Skip QA acceptance checks at the end")
     return parser
@@ -74,6 +93,356 @@ def _dump_json(path: Path, payload: dict[str, Any]) -> None:
 def _run(cmd: list[str]) -> None:
     print("$", " ".join(cmd))
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+
+
+def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "codex",
+        "exec",
+        "--cd",
+        str(REPO_ROOT),
+        "--sandbox",
+        "read-only",
+        "--output-schema",
+        str(schema_path),
+        "--output-last-message",
+        str(output_path),
+        "-",
+    ]
+    print("$", " ".join(cmd))
+    try:
+        subprocess.run(cmd, cwd=REPO_ROOT, input=prompt.encode("utf-8"), check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("codex CLI was not found on PATH") from exc
+
+
+def _render_template(path: Path, replacements: dict[str, str]) -> str:
+    text = path.read_text(encoding="utf-8")
+    for key, value in replacements.items():
+        text = text.replace(f"{{{{{key}}}}}", value)
+    return text
+
+
+def _target_key(raw_target: Any) -> tuple[str, str, str] | None:
+    if not isinstance(raw_target, dict):
+        return None
+    part = str(raw_target.get("part", "")).strip()
+    para_id = str(raw_target.get("para_id", "")).strip()
+    unit_uid = str(raw_target.get("unit_uid", "")).strip()
+    if not part or not para_id or not unit_uid:
+        return None
+    return (part, para_id, unit_uid)
+
+
+def _targets_from_units(units: list[dict[str, Any]]) -> list[dict[str, str]]:
+    targets: list[dict[str, str]] = []
+    for unit in units:
+        key = _target_key(unit)
+        if key is None:
+            continue
+        part, para_id, unit_uid = key
+        targets.append({"part": part, "para_id": para_id, "unit_uid": unit_uid})
+    return targets
+
+
+def _manifest_entry_map(manifest: dict[str, Any]) -> dict[str, int]:
+    chunks = manifest.get("chunks", [])
+    out: dict[str, int] = {}
+    if not isinstance(chunks, list):
+        return out
+    for idx, entry in enumerate(chunks):
+        if not isinstance(entry, dict):
+            continue
+        chunk_id = str(entry.get("chunk_id", "")).strip()
+        if chunk_id:
+            out[chunk_id] = idx
+    return out
+
+
+def _load_manifest_chunk_payload(paths: ProjectPaths, entry: dict[str, Any]) -> dict[str, Any]:
+    rel_path = str(entry.get("path", "")).strip()
+    if not rel_path:
+        raise RuntimeError(f"Chunk path missing for entry: {entry.get('chunk_id')}")
+    chunk_path = paths.chunks_output_dir / rel_path
+    if not chunk_path.exists():
+        raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
+    payload = _load_json(chunk_path)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Chunk payload must be an object: {chunk_path}")
+    return payload
+
+
+def _write_manifest_and_chunks(paths: ProjectPaths, manifest: dict[str, Any], chunk_payloads: dict[str, dict[str, Any]]) -> None:
+    chunks = manifest.get("chunks", [])
+    if not isinstance(chunks, list):
+        raise RuntimeError("Manifest chunks must be a list")
+
+    for idx, entry in enumerate(chunks):
+        if not isinstance(entry, dict):
+            continue
+        chunk_id = str(entry.get("chunk_id", "")).strip()
+        rel_path = str(entry.get("path", "")).strip()
+        if not chunk_id or not rel_path:
+            continue
+        payload = chunk_payloads.get(chunk_id)
+        if payload is None:
+            continue
+
+        payload["chunk_id"] = chunk_id
+        payload["chunk_index"] = idx
+
+        primary_units = payload.get("primary_units", [])
+        context_before = payload.get("context_units_before", [])
+        context_after = payload.get("context_units_after", [])
+        if not isinstance(primary_units, list):
+            primary_units = []
+            payload["primary_units"] = primary_units
+        if not isinstance(context_before, list):
+            context_before = []
+            payload["context_units_before"] = context_before
+        if not isinstance(context_after, list):
+            context_after = []
+            payload["context_units_after"] = context_after
+
+        for unit in primary_units:
+            if isinstance(unit, dict):
+                unit["role"] = "primary"
+                unit["editable"] = True
+        for unit in context_before:
+            if isinstance(unit, dict):
+                unit["role"] = "context_before"
+                unit["editable"] = False
+        for unit in context_after:
+            if isinstance(unit, dict):
+                unit["role"] = "context_after"
+                unit["editable"] = False
+
+        entry["chunk_id"] = chunk_id
+        entry["primary_targets"] = _targets_from_units(primary_units)
+        entry["context_targets_before"] = _targets_from_units(context_before)
+        entry["context_targets_after"] = _targets_from_units(context_after)
+        entry["context_before_unit_uids"] = [t["unit_uid"] for t in entry["context_targets_before"]]
+        entry["context_after_unit_uids"] = [t["unit_uid"] for t in entry["context_targets_after"]]
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            source_span = metadata.get("source_span")
+            if isinstance(source_span, dict):
+                source_span["primary_unit_count"] = len(primary_units)
+                source_span["context_before_count"] = len(context_before)
+                source_span["context_after_count"] = len(context_after)
+
+        _dump_json(paths.chunks_output_dir / rel_path, payload)
+
+    manifest["chunk_count"] = len(chunks)
+    _dump_json(paths.chunks_output_dir / "manifest.json", manifest)
+
+
+def _apply_shift_boundary(
+    *,
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any],
+    move_primary_units: int,
+    left_chunk_id: str,
+    right_chunk_id: str,
+) -> None:
+    left_primary = left_payload.get("primary_units", [])
+    right_primary = right_payload.get("primary_units", [])
+
+    if not isinstance(left_primary, list) or not isinstance(right_primary, list):
+        raise RuntimeError("Chunk payload primary_units must be lists")
+
+    if move_primary_units == 0:
+        return
+
+    if move_primary_units > 0:
+        if move_primary_units > len(right_primary):
+            raise RuntimeError(f"shift_boundary move exceeds right chunk size: {right_chunk_id}")
+        moved = right_primary[:move_primary_units]
+        left_payload["primary_units"] = left_primary + moved
+        right_payload["primary_units"] = right_primary[move_primary_units:]
+    else:
+        count = -move_primary_units
+        if count > len(left_primary):
+            raise RuntimeError(f"shift_boundary move exceeds left chunk size: {left_chunk_id}")
+        moved = left_primary[-count:]
+        left_payload["primary_units"] = left_primary[:-count]
+        right_payload["primary_units"] = moved + right_primary
+
+    left_after = right_payload["primary_units"][0:1] if right_payload.get("primary_units") else []
+    right_before = left_payload["primary_units"][-1:] if left_payload.get("primary_units") else []
+    left_payload["context_units_after"] = left_after
+    right_payload["context_units_before"] = right_before
+
+
+def _apply_merge_adjacent(
+    *,
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any],
+) -> None:
+    left_primary = left_payload.get("primary_units", [])
+    right_primary = right_payload.get("primary_units", [])
+    left_before = left_payload.get("context_units_before", [])
+    right_after = right_payload.get("context_units_after", [])
+
+    if not isinstance(left_primary, list) or not isinstance(right_primary, list):
+        raise RuntimeError("Chunk payload primary_units must be lists")
+
+    left_payload["primary_units"] = left_primary + right_primary
+    left_payload["context_units_before"] = left_before if isinstance(left_before, list) else []
+    left_payload["context_units_after"] = right_after if isinstance(right_after, list) else []
+
+
+def _apply_chunk_boundary_fixes(paths: ProjectPaths, fixes: list[dict[str, Any]]) -> dict[str, Any]:
+    manifest_path = paths.chunks_output_dir / "manifest.json"
+    manifest = _load_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise RuntimeError("Chunk manifest payload must be an object")
+
+    chunks = manifest.get("chunks", [])
+    if not isinstance(chunks, list):
+        raise RuntimeError("Chunk manifest must include a list at chunks")
+
+    applied: list[dict[str, Any]] = []
+    chunk_payloads: dict[str, dict[str, Any]] = {}
+
+    for fix in fixes:
+        if not isinstance(fix, dict):
+            continue
+        fix_type = str(fix.get("type", "")).strip()
+        left_chunk_id = str(fix.get("left_chunk_id", "")).strip()
+        right_chunk_id = str(fix.get("right_chunk_id", "")).strip()
+
+        index_map = _manifest_entry_map(manifest)
+        if left_chunk_id not in index_map or right_chunk_id not in index_map:
+            raise RuntimeError(f"Chunk QA fix references unknown chunk ids: {left_chunk_id}, {right_chunk_id}")
+
+        left_idx = index_map[left_chunk_id]
+        right_idx = index_map[right_chunk_id]
+        if right_idx != left_idx + 1:
+            raise RuntimeError(f"Chunk QA fix must reference adjacent chunks in manifest order: {left_chunk_id}, {right_chunk_id}")
+
+        left_entry = chunks[left_idx]
+        right_entry = chunks[right_idx]
+        if not isinstance(left_entry, dict) or not isinstance(right_entry, dict):
+            raise RuntimeError("Chunk manifest entries must be objects")
+
+        left_payload = chunk_payloads.get(left_chunk_id) or _load_manifest_chunk_payload(paths, left_entry)
+        right_payload = chunk_payloads.get(right_chunk_id) or _load_manifest_chunk_payload(paths, right_entry)
+
+        if fix_type == "shift_boundary":
+            move_primary_units = int(fix.get("move_primary_units", 0))
+            _apply_shift_boundary(
+                left_payload=left_payload,
+                right_payload=right_payload,
+                move_primary_units=move_primary_units,
+                left_chunk_id=left_chunk_id,
+                right_chunk_id=right_chunk_id,
+            )
+            chunk_payloads[left_chunk_id] = left_payload
+            chunk_payloads[right_chunk_id] = right_payload
+            applied.append(
+                {
+                    "type": "shift_boundary",
+                    "left_chunk_id": left_chunk_id,
+                    "right_chunk_id": right_chunk_id,
+                    "move_primary_units": move_primary_units,
+                }
+            )
+            continue
+
+        if fix_type == "merge_adjacent":
+            _apply_merge_adjacent(left_payload=left_payload, right_payload=right_payload)
+            chunk_payloads[left_chunk_id] = left_payload
+
+            right_rel_path = str(right_entry.get("path", "")).strip()
+            if right_rel_path:
+                right_file = paths.chunks_output_dir / right_rel_path
+                if right_file.exists():
+                    right_file.unlink()
+
+            chunks.pop(right_idx)
+            chunk_payloads.pop(right_chunk_id, None)
+
+            applied.append(
+                {
+                    "type": "merge_adjacent",
+                    "left_chunk_id": left_chunk_id,
+                    "right_chunk_id": right_chunk_id,
+                }
+            )
+            continue
+
+        raise RuntimeError(f"Unsupported chunk QA fix type: {fix_type}")
+
+    _write_manifest_and_chunks(paths, manifest, chunk_payloads)
+    return {"applied_fixes": applied, "chunk_count": len(chunks)}
+
+
+def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
+    manifest_path = paths.chunks_output_dir / "manifest.json"
+    manifest = _load_json(manifest_path)
+    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    if not isinstance(chunks, list) or not chunks:
+        raise RuntimeError("Chunk manifest has no chunks for QA")
+
+    sample_paths = []
+    for entry in chunks[:3]:
+        if not isinstance(entry, dict):
+            continue
+        rel = str(entry.get("path", "")).strip()
+        if rel:
+            sample_paths.append(str((paths.chunks_output_dir / rel).resolve()))
+
+    prompt = _render_template(
+        TEMPLATE_CHUNK_QA,
+        {
+            "MANIFEST_PATH": str(manifest_path.resolve()),
+            "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
+        },
+    )
+    _run_codex_exec(prompt=prompt, schema_path=SCHEMA_CHUNK_QA, output_path=paths.chunk_qa_report)
+    first_report = _load_json(paths.chunk_qa_report)
+
+    status = str(first_report.get("status", "")).strip()
+    if status == "ok":
+        return {"status": "ok", "passes": 1, "applied_fixes": []}
+
+    if status != "needs_fix":
+        raise RuntimeError(f"Unexpected chunk QA status: {status!r}")
+
+    fixes = first_report.get("fixes", [])
+    if not isinstance(fixes, list) or not fixes:
+        raise RuntimeError("Chunk QA requested fixes but returned no fixes")
+
+    apply_result = _apply_chunk_boundary_fixes(paths, fixes)
+
+    manifest = _load_json(manifest_path)
+    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    sample_paths = []
+    if isinstance(chunks, list):
+        for entry in chunks[:3]:
+            if not isinstance(entry, dict):
+                continue
+            rel = str(entry.get("path", "")).strip()
+            if rel:
+                sample_paths.append(str((paths.chunks_output_dir / rel).resolve()))
+
+    second_prompt = _render_template(
+        TEMPLATE_CHUNK_QA,
+        {
+            "MANIFEST_PATH": str(manifest_path.resolve()),
+            "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
+        },
+    )
+    _run_codex_exec(prompt=second_prompt, schema_path=SCHEMA_CHUNK_QA, output_path=paths.chunk_qa_report)
+    second_report = _load_json(paths.chunk_qa_report)
+    second_status = str(second_report.get("status", "")).strip()
+    if second_status != "ok":
+        raise RuntimeError(f"Chunk QA still failing after deterministic fixes. See {paths.chunk_qa_report}")
+
+    return {"status": "ok", "passes": 2, "applied_fixes": apply_result.get("applied_fixes", [])}
 
 
 def _utf16_offsets(text: str) -> list[int]:
@@ -235,6 +604,240 @@ def _discover_synthetic_chunk_result(paths: ProjectPaths) -> SyntheticChunkResul
     raise RuntimeError("Unable to generate synthetic chunk results from chunk primary_units")
 
 
+def _normalize_range(raw_range: Any) -> dict[str, int] | None:
+    if not isinstance(raw_range, dict):
+        return None
+    start = raw_range.get("start")
+    end = raw_range.get("end")
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    if start < 0 or end < 0 or start > end:
+        return None
+    return {"start": start, "end": end}
+
+
+def _sanitize_chunk_result_ops(
+    *,
+    chunk_id: str,
+    raw_payload: dict[str, Any],
+    chunk_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    primary_units = chunk_payload.get("primary_units", [])
+    if not isinstance(primary_units, list) or not primary_units:
+        raise RuntimeError(f"Chunk {chunk_id} has no primary_units")
+
+    primary_targets: set[tuple[str, str, str]] = set()
+    primary_by_para: dict[tuple[str, str], list[str]] = {}
+    for unit in primary_units:
+        key = _target_key(unit)
+        if key is None:
+            continue
+        primary_targets.add(key)
+        part, para_id, unit_uid = key
+        primary_by_para.setdefault((part, para_id), []).append(unit_uid)
+
+    first_primary = next(iter(primary_targets), None)
+    if first_primary is None:
+        raise RuntimeError(f"Chunk {chunk_id} has no valid primary target identities")
+
+    fallback_target = {"part": first_primary[0], "para_id": first_primary[1], "unit_uid": first_primary[2]}
+
+    def comment_op(reason: str, *, from_op: dict[str, Any] | None) -> dict[str, Any]:
+        target = fallback_target
+        rng = {"start": 0, "end": 0}
+        snippet = ""
+        if isinstance(from_op, dict):
+            maybe_target = from_op.get("target")
+            maybe_key = _target_key(maybe_target)
+            if maybe_key in primary_targets:
+                target = {"part": maybe_key[0], "para_id": maybe_key[1], "unit_uid": maybe_key[2]}
+            maybe_range = _normalize_range(from_op.get("range"))
+            if maybe_range is not None:
+                rng = maybe_range
+            maybe_expected = from_op.get("expected")
+            if isinstance(maybe_expected, dict):
+                snippet = str(maybe_expected.get("snippet", ""))
+        return {
+            "type": "add_comment",
+            "target": target,
+            "range": rng,
+            "expected": {"snippet": snippet},
+            "comment_text": f"Sanitized op in {chunk_id}: {reason}.",
+        }
+
+    raw_ops = raw_payload.get("ops", [])
+    if not isinstance(raw_ops, list):
+        raw_ops = []
+
+    sanitized_ops: list[dict[str, Any]] = []
+    converted: list[dict[str, Any]] = []
+    kept = 0
+
+    for idx, raw_op in enumerate(raw_ops):
+        if not isinstance(raw_op, dict):
+            sanitized_ops.append(comment_op("op was not an object", from_op=None))
+            converted.append({"op_index": idx, "reason": "non_object_op"})
+            continue
+
+        op_type = str(raw_op.get("type", "")).strip()
+        if op_type not in VALID_OP_TYPES:
+            sanitized_ops.append(comment_op(f"unsupported type {op_type!r}", from_op=raw_op))
+            converted.append({"op_index": idx, "reason": "invalid_type"})
+            continue
+
+        target = raw_op.get("target")
+        key = _target_key(target)
+        if key is None and isinstance(target, dict):
+            part = str(target.get("part", "")).strip()
+            para_id = str(target.get("para_id", "")).strip()
+            candidates = primary_by_para.get((part, para_id), [])
+            if len(candidates) == 1:
+                key = (part, para_id, candidates[0])
+
+        if key is None or key not in primary_targets:
+            sanitized_ops.append(comment_op("target is not in primary_units", from_op=raw_op))
+            converted.append({"op_index": idx, "reason": "non_primary_target"})
+            continue
+
+        normalized_target = {"part": key[0], "para_id": key[1], "unit_uid": key[2]}
+        expected = raw_op.get("expected")
+        snippet = ""
+        if isinstance(expected, dict):
+            snippet = str(expected.get("snippet", ""))
+
+        normalized_range = _normalize_range(raw_op.get("range"))
+        if normalized_range is None and op_type == "add_comment":
+            normalized_range = {"start": 0, "end": 0}
+
+        sanitized: dict[str, Any] = {
+            "type": op_type,
+            "target": normalized_target,
+            "expected": {"snippet": snippet},
+        }
+        if normalized_range is not None:
+            sanitized["range"] = normalized_range
+
+        if op_type == "replace_range":
+            if "replacement" not in raw_op:
+                sanitized_ops.append(comment_op("replace_range missing replacement", from_op=raw_op))
+                converted.append({"op_index": idx, "reason": "missing_replacement"})
+                continue
+            sanitized["replacement"] = str(raw_op.get("replacement"))
+        elif op_type == "insert_at":
+            if normalized_range is not None and normalized_range["start"] != normalized_range["end"]:
+                sanitized_ops.append(comment_op("insert_at requires collapsed range", from_op=raw_op))
+                converted.append({"op_index": idx, "reason": "insert_non_collapsed_range"})
+                continue
+            if "new_text" not in raw_op:
+                sanitized_ops.append(comment_op("insert_at missing new_text", from_op=raw_op))
+                converted.append({"op_index": idx, "reason": "missing_new_text"})
+                continue
+            sanitized["new_text"] = str(raw_op.get("new_text"))
+        elif op_type == "add_comment":
+            comment_text = str(raw_op.get("comment_text", "")).strip()
+            if not comment_text:
+                comment_text = f"Sanitized comment placeholder for {chunk_id}."
+            sanitized["comment_text"] = comment_text
+        elif op_type == "delete_range":
+            pass
+
+        sanitized_ops.append(sanitized)
+        kept += 1
+
+    suggestions = raw_payload.get("suggestions", [])
+    if not isinstance(suggestions, list):
+        suggestions = []
+
+    sanitized_payload = {
+        "schema_version": "chunk_result.v1",
+        "chunk_id": chunk_id,
+        "status": "ok",
+        "summary": "Chunk result sanitized by runner ownership and shape checks.",
+        "ops": sanitized_ops,
+        "suggestions": [str(item) for item in suggestions if isinstance(item, str)],
+    }
+
+    log_payload = {
+        "chunk_id": chunk_id,
+        "input_op_count": len(raw_ops),
+        "output_op_count": len(sanitized_ops),
+        "kept_ops": kept,
+        "converted_ops": len(converted),
+        "conversions": converted,
+    }
+    return sanitized_payload, log_payload
+
+
+def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str, Any]:
+    manifest_path = paths.chunks_output_dir / "manifest.json"
+    manifest = _load_json(manifest_path)
+    chunk_entries = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    if not isinstance(chunk_entries, list) or not chunk_entries:
+        raise RuntimeError("Chunk manifest has no chunks for review")
+
+    for stale in paths.chunk_results_dir.glob("chunk_*_result.json"):
+        stale.unlink()
+    for stale in paths.chunk_results_dir.glob("chunk_*_sanitization.json"):
+        stale.unlink()
+
+    def process_chunk(entry: dict[str, Any]) -> dict[str, Any]:
+        chunk_id = str(entry.get("chunk_id", "")).strip()
+        rel_path = str(entry.get("path", "")).strip()
+        if not chunk_id or not rel_path:
+            raise RuntimeError("Manifest chunk entry is missing chunk_id/path")
+
+        chunk_path = paths.chunks_output_dir / rel_path
+        if not chunk_path.exists():
+            raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
+
+        output_path = paths.chunk_results_dir / f"{chunk_id}_result.json"
+        prompt = _render_template(
+            TEMPLATE_CHUNK_REVIEW,
+            {
+                "WORKFLOW_XML_PATH": str(paths.workflow_xml),
+                "CHUNK_PATH": str(chunk_path.resolve()),
+            },
+        )
+        _run_codex_exec(prompt=prompt, schema_path=SCHEMA_CHUNK_REVIEW, output_path=output_path)
+
+        raw_payload = _load_json(output_path)
+        chunk_payload = _load_json(chunk_path)
+        sanitized_payload, log_payload = _sanitize_chunk_result_ops(
+            chunk_id=chunk_id,
+            raw_payload=raw_payload,
+            chunk_payload=chunk_payload,
+        )
+        _dump_json(output_path, sanitized_payload)
+        _dump_json(paths.chunk_results_dir / f"{chunk_id}_sanitization.json", log_payload)
+
+        return {
+            "chunk_id": chunk_id,
+            "result_path": str(output_path),
+            "input_ops": log_payload["input_op_count"],
+            "output_ops": log_payload["output_op_count"],
+            "converted_ops": log_payload["converted_ops"],
+        }
+
+    worker_count = max(1, int(max_concurrency))
+    summaries: list[dict[str, Any]] = []
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(process_chunk, entry) for entry in chunk_entries if isinstance(entry, dict)]
+        for future in as_completed(futures):
+            summaries.append(future.result())
+
+    summaries.sort(key=lambda item: str(item.get("chunk_id", "")))
+    aggregate = {
+        "chunk_count": len(summaries),
+        "total_input_ops": sum(int(item.get("input_ops", 0)) for item in summaries),
+        "total_output_ops": sum(int(item.get("output_ops", 0)) for item in summaries),
+        "total_converted_ops": sum(int(item.get("converted_ops", 0)) for item in summaries),
+        "chunks": summaries,
+    }
+    _dump_json(paths.chunk_result_sanitization_log, aggregate)
+    return aggregate
+
+
 def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
     project_dir = (REPO_ROOT / "projects" / str(args.project)).resolve()
     workflow_xml = (project_dir / "workflows" / f"{args.workflow}.xml").resolve()
@@ -250,6 +853,11 @@ def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
         patch_output_dir=(project_dir / "artifacts" / "patch").resolve(),
         merged_patch=(project_dir / "artifacts" / "patch" / "merged_patch.json").resolve(),
         merge_report=(project_dir / "artifacts" / "patch" / "merge_report.json").resolve(),
+        final_patch=(project_dir / "artifacts" / "patch" / "final_patch.json").resolve(),
+        chunk_qa_report=(project_dir / "artifacts" / "chunks" / "chunk_qa_report.json").resolve(),
+        merge_qa_report=(project_dir / "artifacts" / "patch" / "merge_qa_report.json").resolve(),
+        final_patch_overrides=(project_dir / "artifacts" / "patch" / "final_patch_overrides.json").resolve(),
+        chunk_result_sanitization_log=(project_dir / "artifacts" / "chunk_results" / "sanitization_report.json").resolve(),
         apply_log=(project_dir / "artifacts" / "apply" / "apply_log.json").resolve(),
         annotated_docx=(project_dir / "output" / "annotated.docx").resolve(),
         changes_md=(project_dir / "output" / "changes.md").resolve(),
@@ -262,6 +870,16 @@ def _ensure_project_prereqs(paths: ProjectPaths) -> None:
         raise FileNotFoundError(f"Project directory not found: {paths.project_dir}")
     if not paths.workflow_xml.exists():
         raise FileNotFoundError(f"Workflow XML not found: {paths.workflow_xml}")
+    try:
+        workflow_root = ET.fromstring(paths.workflow_xml.read_text(encoding="utf-8"))
+    except ET.ParseError as exc:
+        raise RuntimeError(f"Invalid workflow XML: {paths.workflow_xml} ({exc})") from exc
+    if workflow_root.tag != "workflow":
+        raise RuntimeError(f"Workflow root must be <workflow>: {paths.workflow_xml}")
+    if str(workflow_root.attrib.get("name", "")).strip() != paths.workflow_xml.stem:
+        raise RuntimeError(
+            f"Workflow name mismatch in {paths.workflow_xml}: expected name='{paths.workflow_xml.stem}'"
+        )
     if not paths.source_docx.exists():
         raise FileNotFoundError(f"Source DOCX not found: {paths.source_docx}")
     if not paths.constants.exists():
@@ -283,6 +901,7 @@ def _assert_outputs(paths: ProjectPaths) -> None:
     required = [
         paths.merged_patch,
         paths.merge_report,
+        paths.final_patch,
         paths.apply_log,
         paths.annotated_docx,
         paths.changes_md,
@@ -294,7 +913,117 @@ def _assert_outputs(paths: ProjectPaths) -> None:
         raise RuntimeError(f"Pipeline finished with missing outputs:\n{formatted}")
 
 
-def run_pipeline(paths: ProjectPaths, *, author: str, dry_run: bool, validate: bool) -> SyntheticChunkResult | None:
+def _resolve_action_index(action: dict[str, Any], base_ops: list[dict[str, Any]]) -> int | None:
+    if "op_index" in action and isinstance(action.get("op_index"), int):
+        index = int(action["op_index"])
+        return index if 0 <= index < len(base_ops) else None
+
+    op_id = str(action.get("op_id", "")).strip()
+    if not op_id:
+        return None
+    for idx, op in enumerate(base_ops):
+        if str(op.get("op_id", "")).strip() == op_id or str(op.get("dedup_key", "")).strip() == op_id:
+            return idx
+    return None
+
+
+def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str) -> dict[str, Any]:
+    prompt = _render_template(
+        TEMPLATE_MERGE_QA,
+        {
+            "MERGED_PATCH_PATH": str(paths.merged_patch),
+            "MERGE_REPORT_PATH": str(paths.merge_report),
+        },
+    )
+    _run_codex_exec(prompt=prompt, schema_path=SCHEMA_MERGE_QA, output_path=paths.merge_qa_report)
+
+    merge_qa = _load_json(paths.merge_qa_report)
+    actions = merge_qa.get("actions", [])
+    if not isinstance(actions, list):
+        actions = []
+
+    merged_patch = _load_json(paths.merged_patch)
+    base_ops = merged_patch.get("ops", [])
+    if not isinstance(base_ops, list):
+        raise RuntimeError("merged_patch.json must contain ops list")
+
+    dropped_indices: set[int] = set()
+    downgraded: dict[int, str] = {}
+    applied_actions: list[dict[str, Any]] = []
+    ignored_actions: list[dict[str, Any]] = []
+
+    for action in actions:
+        if not isinstance(action, dict):
+            ignored_actions.append({"reason": "action_not_object", "action": action})
+            continue
+
+        action_type = str(action.get("type", "")).strip()
+        index = _resolve_action_index(action, base_ops)
+        if index is None:
+            ignored_actions.append({"reason": "unresolved_op_reference", "action": action})
+            continue
+
+        if action_type == "drop_op":
+            dropped_indices.add(index)
+            applied_actions.append({"type": "drop_op", "op_index": index})
+            continue
+
+        if action_type == "downgrade_to_comment":
+            comment_text = str(action.get("comment_text", "")).strip()
+            if not comment_text:
+                ignored_actions.append({"reason": "missing_comment_text", "action": action})
+                continue
+            downgraded[index] = comment_text
+            applied_actions.append({"type": "downgrade_to_comment", "op_index": index})
+            continue
+
+        ignored_actions.append({"reason": "unsupported_action_type", "action": action})
+
+    final_ops: list[dict[str, Any]] = []
+    for idx, op in enumerate(base_ops):
+        if idx in dropped_indices:
+            continue
+
+        rewritten = copy.deepcopy(op)
+        if idx in downgraded:
+            rewritten = {
+                "type": "add_comment",
+                "target": rewritten.get("target", {}),
+                "range": rewritten.get("range", {"start": 0, "end": 0}),
+                "expected": rewritten.get("expected", {"snippet": ""}),
+                "comment_text": downgraded[idx],
+            }
+        final_ops.append(rewritten)
+
+    final_patch = {
+        "schema_version": str(merged_patch.get("schema_version", "patch.v1")),
+        "created_at": str(merged_patch.get("created_at", "")),
+        "author": author,
+        "ops": final_ops,
+    }
+    _dump_json(paths.final_patch, final_patch)
+
+    override_report = {
+        "actions_in": len(actions),
+        "actions_applied": len(applied_actions),
+        "actions_ignored": len(ignored_actions),
+        "applied": applied_actions,
+        "ignored": ignored_actions,
+        "merged_ops": len(base_ops),
+        "final_ops": len(final_ops),
+    }
+    _dump_json(paths.final_patch_overrides, override_report)
+    return override_report
+
+
+def run_pipeline(
+    paths: ProjectPaths,
+    *,
+    author: str,
+    dry_run: bool,
+    validate: bool,
+    max_concurrency: int,
+) -> SyntheticChunkResult | None:
     _run(
         [
             sys.executable,
@@ -331,6 +1060,17 @@ def run_pipeline(paths: ProjectPaths, *, author: str, dry_run: bool, validate: b
     if dry_run:
         synthetic = _discover_synthetic_chunk_result(paths)
         print(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
+    else:
+        qa = _run_chunk_qa_with_optional_fix(paths)
+        print(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
+        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency)
+        print(
+            "Chunk reviews complete: "
+            f"chunks={review_summary['chunk_count']} "
+            f"input_ops={review_summary['total_input_ops']} "
+            f"output_ops={review_summary['total_output_ops']} "
+            f"converted={review_summary['total_converted_ops']}"
+        )
 
     _run(
         [
@@ -344,12 +1084,37 @@ def run_pipeline(paths: ProjectPaths, *, author: str, dry_run: bool, validate: b
             "artifacts/docx_extract/linear_units.json",
             "--chunks-manifest",
             "artifacts/chunks/manifest.json",
+            "--review-units",
+            "artifacts/docx_extract/review_units.json",
             "--output-dir",
             "artifacts/patch",
             "--author",
             author,
         ]
     )
+
+    if dry_run:
+        _dump_json(paths.final_patch, _load_json(paths.merged_patch))
+        _dump_json(
+            paths.final_patch_overrides,
+            {
+                "actions_in": 0,
+                "actions_applied": 0,
+                "actions_ignored": 0,
+                "applied": [],
+                "ignored": [],
+                "merged_ops": len(_load_json(paths.merged_patch).get("ops", [])),
+                "final_ops": len(_load_json(paths.final_patch).get("ops", [])),
+            },
+        )
+    else:
+        override_report = _apply_merge_qa_overrides(paths, author=author)
+        print(
+            "Merge QA overrides: "
+            f"actions_in={override_report['actions_in']} "
+            f"applied={override_report['actions_applied']} "
+            f"ignored={override_report['actions_ignored']}"
+        )
 
     _run(
         [
@@ -360,7 +1125,7 @@ def run_pipeline(paths: ProjectPaths, *, author: str, dry_run: bool, validate: b
             "--input-docx",
             "input/source.docx",
             "--patch",
-            "artifacts/patch/merged_patch.json",
+            "artifacts/patch/final_patch.json",
             "--review-units",
             "artifacts/docx_extract/review_units.json",
             "--output-docx",
@@ -381,7 +1146,7 @@ def run_pipeline(paths: ProjectPaths, *, author: str, dry_run: bool, validate: b
             "--review-units",
             "artifacts/docx_extract/review_units.json",
             "--patch",
-            "artifacts/patch/merged_patch.json",
+            "artifacts/patch/final_patch.json",
             "--apply-log",
             "artifacts/apply/apply_log.json",
             "--output-md",
@@ -406,12 +1171,17 @@ def main() -> int:
         paths = _resolve_paths(args)
         _ensure_project_prereqs(paths)
 
-        if not args.dry_run:
-            if not any(paths.chunk_results_dir.glob("chunk_*_result.json")):
-                raise RuntimeError(
-                    "No chunk results found for non-dry run. Use --dry-run or provide chunk reviewer outputs in artifacts/chunk_results/."
-                )
-        else:
+        for stale in [
+            paths.chunk_qa_report,
+            paths.merge_qa_report,
+            paths.final_patch,
+            paths.final_patch_overrides,
+            paths.chunk_result_sanitization_log,
+        ]:
+            if stale.exists():
+                stale.unlink()
+
+        if args.dry_run:
             for stale in paths.chunk_results_dir.glob("chunk_*_result.json"):
                 stale.unlink()
 
@@ -420,11 +1190,13 @@ def main() -> int:
             author=str(args.author),
             dry_run=bool(args.dry_run),
             validate=not bool(args.skip_validation),
+            max_concurrency=int(args.max_concurrency),
         )
 
         print("Project run completed successfully.")
         print(f"Project: {paths.project_dir}")
         print(f"Workflow: {paths.workflow_xml.name}")
+        print(f"Final patch: {paths.final_patch}")
         print(f"Annotated DOCX: {paths.annotated_docx}")
         print(f"Change report: {paths.changes_md}")
         if synthetic is not None:

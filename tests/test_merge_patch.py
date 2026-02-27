@@ -24,6 +24,7 @@ def _run_merge(
     linear_units_path: Path,
     chunks_manifest_path: Path,
     output_dir: Path,
+    review_units_path: Path | None = None,
     author: str = "merge-test",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     project_dir = output_dir.parent
@@ -40,6 +41,8 @@ def _run_merge(
             str(linear_units_path),
             "--chunks-manifest",
             str(chunks_manifest_path),
+            "--review-units",
+            str(review_units_path) if review_units_path is not None else str(project_dir / "missing_review_units.json"),
             "--output-dir",
             str(output_dir),
             "--author",
@@ -173,6 +176,22 @@ def _write_linear_units(path: Path, *, targets: list[dict[str, str]]) -> None:
             ],
         },
     )
+
+
+def _write_review_units(path: Path, *, unit_text_by_target: dict[tuple[str, str, str], str]) -> None:
+    units = []
+    for index, ((part, para_id, unit_uid), accepted_text) in enumerate(unit_text_by_target.items()):
+        units.append(
+            {
+                "part": part,
+                "para_id": para_id,
+                "unit_uid": unit_uid,
+                "accepted_text": accepted_text,
+                "order_index": index,
+                "location": {"global_order_index": index},
+            }
+        )
+    _write_json(path, {"units": units})
 
 
 def test_merge_patch_dedup_conflict_downgrade_and_ordering(tmp_path: Path) -> None:
@@ -717,3 +736,139 @@ def test_merge_patch_rejects_missing_unit_uid_when_primary_match_is_ambiguous(tm
     assert merge_report["stats"]["ownership_rejected_ops"] == 1
     assert merge_report["stats"]["ownership_rejected_ambiguous_missing_unit_uid_ops"] == 1
     assert merge_report["ownership"]["rejections"][0]["reason"] == "missing_unit_uid_ambiguous_primary_match"
+
+
+def test_merge_resolves_missing_range_from_expected_snippet(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    review_units_path = tmp_path / "docx_extract/review_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    target = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [target]}},
+    )
+    _write_linear_units(linear_units_path, targets=[target])
+    _write_review_units(review_units_path, unit_text_by_target={(target["part"], target["para_id"], target["unit_uid"]): "Alpha beta gamma."})
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "schema_version": "chunk_result.v1",
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": target,
+                    "expected": {"snippet": "beta"},
+                    "replacement": "BETA",
+                }
+            ],
+        },
+    )
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        review_units_path=review_units_path,
+    )
+
+    assert len(merged_patch["ops"]) == 1
+    op = merged_patch["ops"][0]
+    assert op["type"] == "replace_range"
+    assert op["range"]["start"] < op["range"]["end"]
+    assert merge_report["stats"]["range_resolution_events"] >= 1
+
+
+def test_merge_downgrades_ambiguous_missing_range_to_comment(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    review_units_path = tmp_path / "docx_extract/review_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    target = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [target]}},
+    )
+    _write_linear_units(linear_units_path, targets=[target])
+    _write_review_units(
+        review_units_path,
+        unit_text_by_target={(target["part"], target["para_id"], target["unit_uid"]): "beta x beta"},
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "schema_version": "chunk_result.v1",
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": target,
+                    "expected": {"snippet": "beta"},
+                    "replacement": "BETA",
+                }
+            ],
+        },
+    )
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        review_units_path=review_units_path,
+    )
+
+    assert len(merged_patch["ops"]) == 1
+    assert merged_patch["ops"][0]["type"] == "add_comment"
+    assert any(item["reason"] == "range_resolution_ambiguous_snippet" for item in merge_report["range_resolution"])
+
+
+def test_merge_skips_missing_range_when_snippet_not_found(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+    review_units_path = tmp_path / "docx_extract/review_units.json"
+    chunks_output_dir = tmp_path / "chunks"
+
+    target = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
+    chunks_manifest_path = _write_chunks_manifest(
+        chunks_output_dir=chunks_output_dir,
+        chunk_targets={"chunk_0001": {"primary": [target]}},
+    )
+    _write_linear_units(linear_units_path, targets=[target])
+    _write_review_units(review_units_path, unit_text_by_target={(target["part"], target["para_id"], target["unit_uid"]): "Alpha beta gamma"})
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "schema_version": "chunk_result.v1",
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": target,
+                    "expected": {"snippet": "NOT_FOUND"},
+                    "replacement": "whatever",
+                }
+            ],
+        },
+    )
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        chunks_manifest_path=chunks_manifest_path,
+        output_dir=output_dir,
+        review_units_path=review_units_path,
+    )
+
+    assert merged_patch["ops"] == []
+    assert any(item["reason"] == "range_resolution_snippet_not_found" for item in merge_report["invalid_ops"])
