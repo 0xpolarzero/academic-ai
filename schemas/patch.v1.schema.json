@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://academic-ai.local/schemas/patch.v1.schema.json",
+  "title": "Patch V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "created_at",
+    "author",
+    "ops"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "patch.v1"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "author": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ops": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/patch_operation"
+      }
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "part",
+        "para_id"
+      ],
+      "properties": {
+        "part": {
+          "type": "string",
+          "minLength": 1
+        },
+        "para_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "unit_uid": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "Stable location identity. unit_uid is optional when para-level targeting is sufficient."
+    },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inclusive UTF-16 code unit offset in accepted_text."
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exclusive UTF-16 code unit offset in accepted_text."
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snippet"
+      ],
+      "properties": {
+        "snippet": {
+          "type": "string",
+          "description": "Expected exact text at range before applying patch."
+        }
+      }
+    },
+    "patch_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "target",
+        "range",
+        "expected"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "add_comment",
+            "replace_range",
+            "insert_at",
+            "delete_range"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "range": {
+          "$ref": "#/$defs/range"
+        },
+        "expected": {
+          "$ref": "#/$defs/expected"
+        },
+        "comment_text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "new_text": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "dedup_key": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "add_comment"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "comment_text"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "replace_range"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "replacement"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "insert_at"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "new_text"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
