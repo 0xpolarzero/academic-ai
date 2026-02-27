@@ -134,7 +134,8 @@ def search_review_units_payload(
             }
             hits.append(hit)
 
-    hit_unit_count = len({(hit["para_id"], hit["unit_uid"]) for hit in hits})
+    # Count unique hit-bearing units using the complete unit identity.
+    hit_unit_count = len({(hit["part"], hit["para_id"], hit["unit_uid"]) for hit in hits})
 
     return {
         "schema_version": SCHEMA_VERSION,

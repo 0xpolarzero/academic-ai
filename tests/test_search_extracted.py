@@ -84,15 +84,24 @@ def _run_search(
     return json.loads(output_path.read_text(encoding="utf-8"))
 
 
-def _assert_hit_consistency(results: dict[str, Any], units_by_key: dict[tuple[str, str], dict[str, Any]]) -> None:
+def _assert_hit_consistency(
+    results: dict[str, Any], units_by_key: dict[tuple[str, str, str], dict[str, Any]]
+) -> None:
     hits = results.get("hits", [])
     assert results["hit_count"] == len(hits), "hit_count does not match hits length"
-    assert results["hit_unit_count"] == len({(hit["para_id"], hit["unit_uid"]) for hit in hits}), "hit_unit_count mismatch"
+    assert results["hit_unit_count"] == len(
+        {(hit["part"], hit["para_id"], hit["unit_uid"]) for hit in hits}
+    ), "hit_unit_count mismatch"
 
     for hit in hits:
-        key = (hit["para_id"], hit["unit_uid"])
+        assert {"part", "para_id", "unit_uid", "start", "end", "snippet_start", "snippet_end", "snippet"} <= set(
+            hit.keys()
+        ), "Hit payload missing required contract keys"
+
+        key = (str(hit["part"]), str(hit["para_id"]), str(hit["unit_uid"]))
         assert key in units_by_key, f"Hit references unknown unit key: {key}"
         unit = units_by_key[key]
+        assert hit["part"] == unit["part"], "Hit part does not match originating unit"
         accepted_text = str(unit.get("accepted_text", ""))
 
         start = int(hit["start"])
@@ -215,7 +224,7 @@ def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
     review_units_path = _build_synthetic_review_units(tmp_path)
     payload = json.loads(review_units_path.read_text(encoding="utf-8"))
     units = payload["units"]
-    units_by_key = {(unit["para_id"], unit["unit_uid"]): unit for unit in units}
+    units_by_key = {(unit["part"], unit["para_id"], unit["unit_uid"]): unit for unit in units}
 
     literal_results = _run_search(
         review_units_path=review_units_path,
@@ -267,6 +276,80 @@ def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
     _assert_hit_consistency(regex_results, units_by_key)
 
 
+def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
+    units = [
+        {
+            "part": "word/header1.xml",
+            "part_kind": "header",
+            "part_name": "header1",
+            "para_id": "para_0000000000000010",
+            "unit_uid": "unit_000000000010",
+            "accepted_text": "third token here",
+            "heading_path": [],
+            "order_index": 2,
+            "location": {"global_order_index": 2},
+        },
+        {
+            "part": "word/document.xml",
+            "part_kind": "body",
+            "part_name": "document",
+            "para_id": "para_0000000000000008",
+            "unit_uid": "unit_000000000008",
+            "accepted_text": "first token here",
+            "heading_path": [],
+            "order_index": 0,
+            "location": {"global_order_index": 0},
+        },
+        {
+            "part": "word/document.xml",
+            "part_kind": "body",
+            "part_name": "document",
+            "para_id": "para_0000000000000009",
+            "unit_uid": "unit_000000000009",
+            "accepted_text": "second token here",
+            "heading_path": [],
+            "order_index": 1,
+            "location": {"global_order_index": 1},
+        },
+    ]
+    review_units_path = tmp_path / "docx_extract/review_units.json"
+    _write_json(
+        review_units_path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 2,
+            "unit_count": len(units),
+            "units": units,
+        },
+    )
+    units_by_key = {(unit["part"], unit["para_id"], unit["unit_uid"]): unit for unit in units}
+
+    token_results = _run_search(
+        review_units_path=review_units_path,
+        output_dir=tmp_path / "search_token",
+        query="token",
+        snippet_chars=6,
+    )
+    observed_unit_order = [hit["unit_uid"] for hit in token_results["hits"]]
+    assert observed_unit_order == [
+        "unit_000000000008",
+        "unit_000000000009",
+        "unit_000000000010",
+    ], "Hits are not emitted in deterministic unit order"
+    _assert_hit_consistency(token_results, units_by_key)
+
+    no_hit_results = _run_search(
+        review_units_path=review_units_path,
+        output_dir=tmp_path / "search_no_hits",
+        query="definitely_not_present",
+        snippet_chars=6,
+    )
+    assert no_hit_results["unit_count"] == len(units)
+    assert no_hit_results["hit_count"] == 0
+    assert no_hit_results["hit_unit_count"] == 0
+    assert no_hit_results["hits"] == []
+
+
 def test_search_finds_patterns_in_generated_or_fixture_extraction(tmp_path: Path) -> None:
     review_units_path = _load_or_generate_extraction(tmp_path)
     if review_units_path is None:
@@ -291,5 +374,5 @@ def test_search_finds_patterns_in_generated_or_fixture_extraction(tmp_path: Path
     assert results["query"]["mode"] == "literal"
     assert results["hit_count"] >= 1, "Expected at least one hit for selected extraction query"
 
-    units_by_key = {(unit["para_id"], unit["unit_uid"]): unit for unit in units}
+    units_by_key = {(unit["part"], unit["para_id"], unit["unit_uid"]): unit for unit in units}
     _assert_hit_consistency(results, units_by_key)
