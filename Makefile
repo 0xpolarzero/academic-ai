@@ -5,6 +5,8 @@ PYTHON := $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python;
 CONSTANTS := config/constants.json
 FIXTURE_DOCX := fixtures/NPPF_December_2023.docx
 FIXTURE_URL := https://data.parliament.uk/DepositedPapers/Files/DEP2023-1029/NPPF_December_2023.docx
+PROJECT ?= thesis
+WORKFLOW ?= fr_copyedit_conservative
 
 EXTRACT_SCRIPT := .codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py
 CHUNK_SCRIPT := .codex/skills/docx_chunk_atomic_manifest/scripts/chunk_docx.py
@@ -23,9 +25,9 @@ help:
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
 	@echo "  make report    # patch/apply -> output/changes.{md,json}"
 	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
-	@echo "  make run PROJECT=<slug> WORKFLOW=<name>     # run project workflow (runner in phase3)"
+	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [DRY_RUN=1]  # run project workflow"
 	@echo "  make test      # pytest unit + integration checks"
-	@echo "  make e2e       # extract->chunk->synthetic->merge->apply->report"
+	@echo "  make e2e       # offline thesis dry-run + acceptance checks"
 
 project:
 	@test -n "$(PROJECT)" || (echo "Usage: make project PROJECT=<slug>" && exit 2)
@@ -44,8 +46,23 @@ run:
 	@test -n "$(WORKFLOW)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name>" && exit 2)
 	@test -d "projects/$(PROJECT)" || (echo "Missing project directory: projects/$(PROJECT)" && exit 2)
 	@test -f "projects/$(PROJECT)/workflows/$(WORKFLOW).xml" || (echo "Missing workflow file: projects/$(PROJECT)/workflows/$(WORKFLOW).xml" && exit 2)
-	@test -f "scripts/run_project.py" || (echo "Runner not implemented yet: scripts/run_project.py (planned in phase3)" && exit 2)
-	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)"
+	@test -f "scripts/run_project.py" || (echo "Missing runner: scripts/run_project.py" && exit 2)
+	@mkdir -p "projects/$(PROJECT)/input"
+	@if [ ! -f "projects/$(PROJECT)/input/source.docx" ]; then \
+		if [ -f "$(FIXTURE_DOCX)" ]; then \
+			cp "$(FIXTURE_DOCX)" "projects/$(PROJECT)/input/source.docx"; \
+			echo "Seeded projects/$(PROJECT)/input/source.docx from fixture"; \
+		else \
+			echo "Missing projects/$(PROJECT)/input/source.docx and fixture $(FIXTURE_DOCX)"; \
+			echo "Run: make fixtures"; \
+			exit 2; \
+		fi; \
+	fi
+	@DRY_FLAG=""; \
+	if [ -z "$(DRY_RUN)" ] || [ "$(DRY_RUN)" = "1" ] || [ "$(DRY_RUN)" = "true" ] || [ "$(DRY_RUN)" = "yes" ]; then \
+		DRY_FLAG="--dry-run"; \
+	fi; \
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$DRY_FLAG
 
 fixtures:
 	@mkdir -p fixtures
@@ -108,7 +125,7 @@ test:
 	$(PYTHON) scripts/run_tests.py
 
 e2e: fixtures
-	$(PYTHON) scripts/run_e2e.py --constants $(CONSTANTS)
+	$(MAKE) run PROJECT=thesis WORKFLOW=fr_copyedit_conservative DRY_RUN=1
 
 clean:
 	@rm -rf artifacts/* output/*
