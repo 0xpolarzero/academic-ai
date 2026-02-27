@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://academic-ai.local/schemas/chunk.v1.schema.json",
+  "title": "Chunk V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "chunk_id",
+    "accepted_text",
+    "primary_units",
+    "context_units"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "chunk.v1"
+    },
+    "chunk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "accepted_text": {
+      "type": "string",
+      "description": "Canonical chunk text used for all range offsets."
+    },
+    "primary_units": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/primary_unit"
+      },
+      "minItems": 1
+    },
+    "context_units": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/context_unit"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "UTF-16 code unit offsets in accepted_text (start inclusive, end exclusive)."
+    },
+    "unit_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "para_id",
+        "unit_uid",
+        "role",
+        "range",
+        "text"
+      ],
+      "properties": {
+        "para_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "unit_uid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "primary",
+            "context"
+          ]
+        },
+        "range": {
+          "$ref": "#/$defs/range"
+        },
+        "text": {
+          "type": "string"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "primary_unit": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/unit_ref"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "primary"
+            }
+          }
+        }
+      ]
+    },
+    "context_unit": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/unit_ref"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "context"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
