@@ -31,5 +31,25 @@
     "indexing": "utf16_code_unit",
     "start_inclusive": true,
     "end_exclusive": true
+  },
+  "pipeline": {
+    "fixture": {
+      "nppf_filename": "NPPF_December_2023.docx",
+      "nppf_url": "https://data.parliament.uk/DepositedPapers/Files/DEP2023-1029/NPPF_December_2023.docx"
+    },
+    "paths": {
+      "fixtures_dir": "fixtures",
+      "default_fixture_docx": "fixtures/NPPF_December_2023.docx",
+      "extract_output_dir": "artifacts/docx_extract",
+      "chunks_output_dir": "artifacts/chunks",
+      "chunk_results_dir": "artifacts/chunk_results",
+      "patch_output_dir": "artifacts/patch",
+      "merged_patch": "artifacts/patch/merged_patch.json",
+      "merge_report": "artifacts/patch/merge_report.json",
+      "apply_log": "artifacts/apply/apply_log.json",
+      "annotated_docx": "output/annotated.docx",
+      "changes_md": "output/changes.md",
+      "changes_json": "output/changes.json"
+    }
   }
 }

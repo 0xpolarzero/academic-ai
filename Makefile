@@ -1,0 +1,93 @@
+SHELL := /bin/sh
+
+PYTHON := $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python; elif command -v python3 >/dev/null 2>&1; then printf '%s' python3; else printf '%s' python; fi)
+
+CONSTANTS := config/constants.json
+FIXTURE_DOCX := fixtures/NPPF_December_2023.docx
+FIXTURE_URL := https://data.parliament.uk/DepositedPapers/Files/DEP2023-1029/NPPF_December_2023.docx
+
+EXTRACT_SCRIPT := .codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py
+CHUNK_SCRIPT := .codex/skills/docx_chunk_atomic_manifest/scripts/chunk_docx.py
+MERGE_SCRIPT := .codex/skills/docx_merge_dedup_validate_patch/scripts/merge_patch.py
+APPLY_SCRIPT := .codex/skills/docx_apply_patch_to_output/scripts/apply_docx_patch.py
+REPORT_SCRIPT := .codex/skills/docx_change_report_before_after/scripts/change_report.py
+
+.PHONY: help fixtures extract chunk merge apply report test e2e clean
+
+help:
+	@echo "Pipeline targets"
+	@echo "  make fixtures  # download fixture DOCX if missing"
+	@echo "  make extract   # DOCX -> artifacts/docx_extract"
+	@echo "  make chunk     # extraction -> artifacts/chunks"
+	@echo "  make merge     # synthetic chunk_results -> artifacts/patch"
+	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
+	@echo "  make report    # patch/apply -> output/changes.{md,json}"
+	@echo "  make test      # pytest unit + integration checks"
+	@echo "  make e2e       # extract->chunk->synthetic->merge->apply->report"
+
+fixtures:
+	@mkdir -p fixtures
+	@if [ -f "$(FIXTURE_DOCX)" ]; then \
+		echo "Fixture already exists: $(FIXTURE_DOCX)"; \
+	elif command -v curl >/dev/null 2>&1; then \
+		echo "Downloading fixture with curl..."; \
+		curl -fL --retry 3 --retry-delay 2 --output "$(FIXTURE_DOCX)" "$(FIXTURE_URL)"; \
+	elif command -v wget >/dev/null 2>&1; then \
+		echo "Downloading fixture with wget..."; \
+		wget -O "$(FIXTURE_DOCX)" "$(FIXTURE_URL)"; \
+	else \
+		echo "No curl/wget available. Download manually:"; \
+		echo "  URL:  $(FIXTURE_URL)"; \
+		echo "  Save: $(FIXTURE_DOCX)"; \
+		exit 1; \
+	fi
+	@echo "Fixture ready: $(FIXTURE_DOCX)"
+
+extract: fixtures
+	@mkdir -p artifacts/docx_extract
+	$(PYTHON) $(EXTRACT_SCRIPT) \
+		--input-docx $(FIXTURE_DOCX) \
+		--output-dir artifacts/docx_extract
+
+chunk: extract
+	$(PYTHON) $(CHUNK_SCRIPT) \
+		--constants $(CONSTANTS) \
+		--review-units artifacts/docx_extract/review_units.json \
+		--linear-units artifacts/docx_extract/linear_units.json \
+		--docx-struct artifacts/docx_extract/docx_struct.json \
+		--output-dir artifacts/chunks
+
+merge: chunk
+	$(PYTHON) scripts/run_e2e.py --constants $(CONSTANTS) --only-generate-synthetic
+	$(PYTHON) $(MERGE_SCRIPT) \
+		--chunk-results-dir artifacts/chunk_results \
+		--linear-units artifacts/docx_extract/linear_units.json \
+		--output-dir artifacts/patch \
+		--author phase8-merge
+
+apply: merge
+	$(PYTHON) $(APPLY_SCRIPT) \
+		--input-docx $(FIXTURE_DOCX) \
+		--patch artifacts/patch/merged_patch.json \
+		--review-units artifacts/docx_extract/review_units.json \
+		--output-docx output/annotated.docx \
+		--apply-log artifacts/apply/apply_log.json \
+		--author phase8-apply
+
+report: apply
+	$(PYTHON) $(REPORT_SCRIPT) \
+		--review-units artifacts/docx_extract/review_units.json \
+		--patch artifacts/patch/merged_patch.json \
+		--apply-log artifacts/apply/apply_log.json \
+		--output-md output/changes.md \
+		--output-json output/changes.json
+
+test:
+	$(PYTHON) scripts/run_tests.py
+
+e2e: fixtures
+	$(PYTHON) scripts/run_e2e.py --constants $(CONSTANTS)
+
+clean:
+	@rm -rf artifacts/* output/*
+	@echo "Cleaned artifacts/ and output/."
