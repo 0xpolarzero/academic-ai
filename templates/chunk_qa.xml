@@ -1,0 +1,27 @@
+<chunk_qa_prompt>
+  <role>You are validating chunk boundaries before per-chunk review.</role>
+  <inputs>
+    <manifest_path>{{MANIFEST_PATH}}</manifest_path>
+    <sample_chunk_paths>{{SAMPLE_CHUNK_PATHS}}</sample_chunk_paths>
+  </inputs>
+  <rules>
+    <rule>Return valid JSON only, matching the provided output schema.</rule>
+    <rule>Focus only on boundary integrity and editability ownership.</rule>
+    <rule>Use fixes only when strictly necessary.</rule>
+  </rules>
+  <output_contract>
+    <status>ok|needs_fix</status>
+    <issues>list of short strings</issues>
+    <fixes>
+      <merge_adjacent>
+        <left_chunk_id>chunk id</left_chunk_id>
+        <right_chunk_id>chunk id</right_chunk_id>
+      </merge_adjacent>
+      <shift_boundary>
+        <left_chunk_id>chunk id</left_chunk_id>
+        <right_chunk_id>chunk id</right_chunk_id>
+        <move_primary_units>int (positive moves right to left; negative moves left to right)</move_primary_units>
+      </shift_boundary>
+    </fixes>
+  </output_contract>
+</chunk_qa_prompt>

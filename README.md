@@ -2,6 +2,49 @@
 
 DOCX review pipeline with deterministic artifacts and writer-facing outputs.
 
+## Project Contract (Phase 0)
+
+All pipeline skills are being standardized to a single required CLI flag:
+
+- `--project-dir projects/<project_slug>`
+
+Path resolution contract:
+
+- `input/source.docx` is resolved under `--project-dir`
+- all intermediate files are resolved under `<project-dir>/artifacts/...`
+- final files are resolved under `<project-dir>/output/...`
+- workflow files are resolved under `<project-dir>/workflows/...`
+
+Planned default structure:
+
+```text
+projects/<project_slug>/
+  input/source.docx
+  workflows/<workflow_name>.xml
+  artifacts/
+  output/
+```
+
+Agent contracts (used by `scripts/run_project.py`):
+
+- prompt templates in `templates/`:
+  - `chunk_qa.xml`
+  - `chunk_review.xml`
+  - `merge_qa.xml`
+- JSON output schemas in `schemas/`:
+  - `chunk_qa.schema.json`
+  - `chunk_result.schema.json`
+  - `merge_qa.schema.json`
+
+Deterministic chunk-boundary fixes (runner behavior):
+
+- source of truth is `artifacts/chunks/manifest.json` chunk order
+- `merge_adjacent(left,right)` merges adjacent chunks into left, removes right
+- `shift_boundary(left,right,move_primary_units)` shifts primary ownership:
+  - positive: move right -> left
+  - negative: move left -> right
+- fixes are applied in chunk index order, then chunks are regenerated and reindexed
+
 ## Path Rules
 
 - Final writer-facing outputs are in `output/` only:

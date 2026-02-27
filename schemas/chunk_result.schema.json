@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://academic-ai.local/schemas/chunk_result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["chunk_id", "ops"],
+  "properties": {
+    "chunk_id": { "type": "string", "minLength": 1 },
+    "suggestions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["type", "target", "expected"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["add_comment", "replace_range", "insert_at", "delete_range"]
+          },
+          "target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["part", "para_id"],
+            "properties": {
+              "part": { "type": "string", "minLength": 1 },
+              "para_id": { "type": "string", "minLength": 1 },
+              "unit_uid": { "type": "string", "minLength": 1 }
+            }
+          },
+          "range": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end"],
+            "properties": {
+              "start": { "type": "integer", "minimum": 0 },
+              "end": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "expected": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["snippet"],
+            "properties": {
+              "snippet": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
