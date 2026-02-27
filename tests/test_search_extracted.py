@@ -14,7 +14,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SEARCH_SCRIPT = REPO_ROOT / ".codex/skills/docx_search_in_extraction/scripts/search_extracted.py"
 EXTRACT_SCRIPT = REPO_ROOT / ".codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py"
 FIXTURES_DIR = REPO_ROOT / "fixtures"
-DEFAULT_REVIEW_UNITS = REPO_ROOT / "artifacts/docx_extract/review_units.json"
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -47,6 +46,7 @@ def _utf16_slice(text: str, start: int, end: int) -> str:
 
 def _run_search(
     *,
+    project_dir: Path,
     review_units_path: Path,
     output_dir: Path,
     query: str,
@@ -57,6 +57,8 @@ def _run_search(
     cmd = [
         sys.executable,
         str(SEARCH_SCRIPT),
+        "--project-dir",
+        str(project_dir),
         "--review-units",
         str(review_units_path),
         "--output-dir",
@@ -121,7 +123,7 @@ def _assert_hit_consistency(
         assert expected_match in expected_snippet, "snippet does not contain matched text"
 
 
-def _build_synthetic_review_units(tmp_path: Path) -> Path:
+def _build_synthetic_review_units(project_dir: Path) -> Path:
     units = [
         {
             "part": "word/document.xml",
@@ -153,7 +155,7 @@ def _build_synthetic_review_units(tmp_path: Path) -> Path:
         "unit_count": len(units),
         "units": units,
     }
-    path = tmp_path / "docx_extract/review_units.json"
+    path = project_dir / "artifacts/docx_extract/review_units.json"
     _write_json(path, payload)
     return path
 
@@ -181,19 +183,18 @@ def _regex_spans_utf16(text: str, query: str, *, ignore_case: bool) -> list[tupl
     return spans
 
 
-def _load_or_generate_extraction(tmp_path: Path) -> Path | None:
-    if DEFAULT_REVIEW_UNITS.exists():
-        return DEFAULT_REVIEW_UNITS
-
+def _load_or_generate_extraction(project_dir: Path) -> Path | None:
     fixture_docx = next(iter(sorted(FIXTURES_DIR.glob("*.docx"))), None)
     if fixture_docx is None:
         return None
 
-    output_dir = tmp_path / "docx_extract_generated"
+    output_dir = project_dir / "artifacts/docx_extract"
     subprocess.run(
         [
             sys.executable,
             str(EXTRACT_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--input-docx",
             str(fixture_docx),
             "--output-dir",
@@ -221,12 +222,15 @@ def _pick_query_from_units(units: list[dict[str, Any]]) -> str | None:
 
 
 def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
-    review_units_path = _build_synthetic_review_units(tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    review_units_path = _build_synthetic_review_units(project_dir)
     payload = json.loads(review_units_path.read_text(encoding="utf-8"))
     units = payload["units"]
     units_by_key = {(unit["part"], unit["para_id"], unit["unit_uid"]): unit for unit in units}
 
     literal_results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_literal",
         query="alpha",
@@ -246,6 +250,7 @@ def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
     _assert_hit_consistency(literal_results, units_by_key)
 
     literal_ignore_case_results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_literal_ignore_case",
         query="alpha",
@@ -257,6 +262,7 @@ def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
     _assert_hit_consistency(literal_ignore_case_results, units_by_key)
 
     regex_results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_regex",
         query=r"alpha|gamma",
@@ -277,6 +283,8 @@ def test_search_literal_regex_and_case_sensitivity(tmp_path: Path) -> None:
 
 
 def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
     units = [
         {
             "part": "word/header1.xml",
@@ -312,7 +320,7 @@ def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
             "location": {"global_order_index": 1},
         },
     ]
-    review_units_path = tmp_path / "docx_extract/review_units.json"
+    review_units_path = project_dir / "artifacts/docx_extract/review_units.json"
     _write_json(
         review_units_path,
         {
@@ -325,6 +333,7 @@ def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
     units_by_key = {(unit["part"], unit["para_id"], unit["unit_uid"]): unit for unit in units}
 
     token_results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_token",
         query="token",
@@ -339,6 +348,7 @@ def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
     _assert_hit_consistency(token_results, units_by_key)
 
     no_hit_results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_no_hits",
         query="definitely_not_present",
@@ -351,7 +361,9 @@ def test_search_ordering_and_no_hits(tmp_path: Path) -> None:
 
 
 def test_search_finds_patterns_in_generated_or_fixture_extraction(tmp_path: Path) -> None:
-    review_units_path = _load_or_generate_extraction(tmp_path)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    review_units_path = _load_or_generate_extraction(project_dir)
     if review_units_path is None:
         pytest.skip("No extraction artifact found and no fixture DOCX available to generate one.")
 
@@ -364,6 +376,7 @@ def test_search_finds_patterns_in_generated_or_fixture_extraction(tmp_path: Path
     assert query is not None, "review_units.json exists but has no searchable accepted_text pattern"
 
     results = _run_search(
+        project_dir=project_dir,
         review_units_path=review_units_path,
         output_dir=tmp_path / "search_integration",
         query=query,

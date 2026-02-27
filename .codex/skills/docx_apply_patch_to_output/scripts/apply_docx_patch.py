@@ -7,18 +7,25 @@ import argparse
 from pathlib import Path
 
 from _apply_lib import (
-    DEFAULT_APPLY_LOG_PATH,
     DEFAULT_AUTHOR,
-    DEFAULT_INPUT_DOCX,
-    DEFAULT_OUTPUT_DOCX,
-    DEFAULT_PATCH_PATH,
-    DEFAULT_REVIEW_UNITS_PATH,
     apply_patch_to_output,
 )
+
+DEFAULT_INPUT_DOCX = Path("input/source.docx")
+DEFAULT_PATCH_PATH = Path("artifacts/patch/merged_patch.json")
+DEFAULT_REVIEW_UNITS_PATH = Path("artifacts/docx_extract/review_units.json")
+DEFAULT_OUTPUT_DOCX = Path("output/annotated.docx")
+DEFAULT_APPLY_LOG_PATH = Path("artifacts/apply/apply_log.json")
+
+
+def _resolve_project_path(project_dir: Path, raw_path: Path) -> Path:
+    expanded = raw_path.expanduser()
+    return expanded if expanded.is_absolute() else (project_dir / expanded)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-dir", type=Path, required=True, help="Project directory root")
     parser.add_argument(
         "--input-docx",
         type=Path,
@@ -61,31 +68,42 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if not args.input_docx.exists():
-        parser.error(f"Input DOCX not found: {args.input_docx}")
-    if args.input_docx.suffix.lower() != ".docx":
-        parser.error(f"Input must be a .docx file: {args.input_docx}")
-    if not args.patch.exists():
-        parser.error(f"Patch file not found: {args.patch}")
-    if not args.review_units.exists():
-        parser.error(f"review_units.json not found: {args.review_units}")
+    project_dir = args.project_dir.expanduser().resolve()
+    if not project_dir.exists() or not project_dir.is_dir():
+        parser.error(f"--project-dir must be an existing directory: {project_dir}")
+
+    input_docx = _resolve_project_path(project_dir, args.input_docx)
+    patch_path = _resolve_project_path(project_dir, args.patch)
+    review_units_path = _resolve_project_path(project_dir, args.review_units)
+    output_docx = _resolve_project_path(project_dir, args.output_docx)
+    apply_log = _resolve_project_path(project_dir, args.apply_log)
+
+    if not input_docx.exists():
+        parser.error(f"Input DOCX not found: {input_docx}")
+    if input_docx.suffix.lower() != ".docx":
+        parser.error(f"Input must be a .docx file: {input_docx}")
+    if not patch_path.exists():
+        parser.error(f"Patch file not found: {patch_path}")
+    if not review_units_path.exists():
+        parser.error(f"review_units.json not found: {review_units_path}")
 
     try:
         result = apply_patch_to_output(
-            input_docx=args.input_docx,
-            patch_path=args.patch,
-            review_units_path=args.review_units,
-            output_docx=args.output_docx,
-            apply_log_path=args.apply_log,
+            input_docx=input_docx,
+            patch_path=patch_path,
+            review_units_path=review_units_path,
+            output_docx=output_docx,
+            apply_log_path=apply_log,
             author=str(args.author),
         )
     except ValueError as exc:
         parser.error(str(exc))
 
     stats = result["stats"]
-    print(f"Source DOCX: {args.input_docx}")
-    print(f"Patch: {args.patch}")
-    print(f"Review units: {args.review_units}")
+    print(f"Project dir: {project_dir}")
+    print(f"Source DOCX: {input_docx}")
+    print(f"Patch: {patch_path}")
+    print(f"Review units: {review_units_path}")
     print(f"Wrote: {result['output_docx']}")
     print(f"Wrote: {result['apply_log']}")
     print(

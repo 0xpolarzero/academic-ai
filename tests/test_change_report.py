@@ -54,10 +54,14 @@ def _run_report(
     output_md: Path,
     output_json: Path,
 ) -> tuple[dict[str, Any], str]:
+    project_dir = output_json.parent.parent
+    project_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             sys.executable,
             str(REPORT_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--review-units",
             str(review_units_path),
             "--patch",

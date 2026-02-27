@@ -311,10 +311,14 @@ def _build_add_comment_only_patch(path: Path, text: str) -> None:
 
 
 def _run_apply(*, source_docx: Path, patch_path: Path, review_units_path: Path, output_docx: Path, apply_log: Path) -> None:
+    project_dir = output_docx.parent.parent
+    project_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             sys.executable,
             str(APPLY_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--input-docx",
             str(source_docx),
             "--patch",

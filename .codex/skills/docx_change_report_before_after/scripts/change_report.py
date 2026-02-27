@@ -7,17 +7,24 @@ import argparse
 from pathlib import Path
 
 from _report_lib import (
-    DEFAULT_APPLY_LOG_PATH,
-    DEFAULT_OUTPUT_JSON_PATH,
-    DEFAULT_OUTPUT_MD_PATH,
-    DEFAULT_PATCH_PATH,
-    DEFAULT_REVIEW_UNITS_PATH,
     build_change_report_artifacts,
 )
+
+DEFAULT_REVIEW_UNITS_PATH = Path("artifacts/docx_extract/review_units.json")
+DEFAULT_PATCH_PATH = Path("artifacts/patch/merged_patch.json")
+DEFAULT_APPLY_LOG_PATH = Path("artifacts/apply/apply_log.json")
+DEFAULT_OUTPUT_MD_PATH = Path("output/changes.md")
+DEFAULT_OUTPUT_JSON_PATH = Path("output/changes.json")
+
+
+def _resolve_project_path(project_dir: Path, raw_path: Path) -> Path:
+    expanded = raw_path.expanduser()
+    return expanded if expanded.is_absolute() else (project_dir / expanded)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-dir", type=Path, required=True, help="Project directory root")
     parser.add_argument(
         "--review-units",
         type=Path,
@@ -55,25 +62,36 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if not args.review_units.exists():
-        parser.error(f"review_units.json not found: {args.review_units}")
-    if not args.patch.exists():
-        parser.error(f"merged_patch.json not found: {args.patch}")
-    if not args.apply_log.exists():
-        parser.error(f"apply_log.json not found: {args.apply_log}")
+    project_dir = args.project_dir.expanduser().resolve()
+    if not project_dir.exists() or not project_dir.is_dir():
+        parser.error(f"--project-dir must be an existing directory: {project_dir}")
+
+    review_units_path = _resolve_project_path(project_dir, args.review_units)
+    patch_path = _resolve_project_path(project_dir, args.patch)
+    apply_log_path = _resolve_project_path(project_dir, args.apply_log)
+    output_md_path = _resolve_project_path(project_dir, args.output_md)
+    output_json_path = _resolve_project_path(project_dir, args.output_json)
+
+    if not review_units_path.exists():
+        parser.error(f"review_units.json not found: {review_units_path}")
+    if not patch_path.exists():
+        parser.error(f"merged_patch.json not found: {patch_path}")
+    if not apply_log_path.exists():
+        parser.error(f"apply_log.json not found: {apply_log_path}")
 
     result = build_change_report_artifacts(
-        review_units_path=args.review_units,
-        patch_path=args.patch,
-        apply_log_path=args.apply_log,
-        output_md_path=args.output_md,
-        output_json_path=args.output_json,
+        review_units_path=review_units_path,
+        patch_path=patch_path,
+        apply_log_path=apply_log_path,
+        output_md_path=output_md_path,
+        output_json_path=output_json_path,
     )
 
     stats = result["stats"]
-    print(f"Review units: {args.review_units}")
-    print(f"Patch: {args.patch}")
-    print(f"Apply log: {args.apply_log}")
+    print(f"Project dir: {project_dir}")
+    print(f"Review units: {review_units_path}")
+    print(f"Patch: {patch_path}")
+    print(f"Apply log: {apply_log_path}")
     print(f"Wrote: {result['output_md']}")
     print(f"Wrote: {result['output_json']}")
     print(

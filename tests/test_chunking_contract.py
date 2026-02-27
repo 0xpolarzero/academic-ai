@@ -24,8 +24,8 @@ def _target_tuple(raw: dict) -> tuple[str, str, str]:
     )
 
 
-def _build_synthetic_extraction(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    extract_dir = tmp_path / "docx_extract"
+def _build_synthetic_extraction(project_dir: Path) -> tuple[Path, Path, Path, Path]:
+    extract_dir = project_dir / "artifacts/docx_extract"
 
     large_unit = " ".join(["oversized"] * 420)
     texts = [
@@ -105,7 +105,7 @@ def _build_synthetic_extraction(tmp_path: Path) -> tuple[Path, Path, Path, Path]
         },
     )
 
-    constants_path = tmp_path / "constants.json"
+    constants_path = project_dir / "config/constants.json"
     _write_json(
         constants_path,
         {
@@ -114,7 +114,7 @@ def _build_synthetic_extraction(tmp_path: Path) -> tuple[Path, Path, Path, Path]
                     "review_units": str(review_units_path),
                     "linear_units": str(linear_units_path),
                     "docx_struct": str(docx_struct_path),
-                    "output_dir": str(tmp_path / "chunks"),
+                    "output_dir": "artifacts/chunks",
                 },
                 "token_budget": {
                     "model_context_window": 120,
@@ -132,13 +132,17 @@ def _build_synthetic_extraction(tmp_path: Path) -> tuple[Path, Path, Path, Path]
 
 
 def test_chunk_manifest_contract(tmp_path: Path) -> None:
-    review_units_path, linear_units_path, docx_struct_path, constants_path = _build_synthetic_extraction(tmp_path)
-    output_dir = tmp_path / "chunks"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    review_units_path, linear_units_path, docx_struct_path, constants_path = _build_synthetic_extraction(project_dir)
+    output_dir = project_dir / "artifacts/chunks"
 
     subprocess.run(
         [
             sys.executable,
             str(CHUNK_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--constants",
             str(constants_path),
             "--review-units",

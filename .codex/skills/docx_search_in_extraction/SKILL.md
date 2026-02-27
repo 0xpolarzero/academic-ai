@@ -6,15 +6,17 @@ description: Search extracted DOCX accepted_text across review units and emit de
 # DOCX Search In Extraction
 
 Input path:
+- Project root: `--project-dir projects/<project_slug>`
 - `artifacts/docx_extract/review_units.json`
 
 Output path:
-- `artifacts/search/search_results.json`
+- `projects/<project_slug>/artifacts/search/search_results.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_search_in_extraction/scripts/search_extracted.py \
+  --project-dir projects/thesis \
   --review-units artifacts/docx_extract/review_units.json \
   --output-dir artifacts/search \
   --query "comment anchor"

@@ -26,12 +26,16 @@ def test_extract_docx_smoke(tmp_path: Path) -> None:
     if fixture_docx is None:
         pytest.skip("No fixture DOCX found in fixtures/*.docx; skipping extraction smoke test.")
 
-    output_dir = tmp_path / "docx_extract"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = project_dir / "artifacts/docx_extract"
 
     subprocess.run(
         [
             sys.executable,
             str(EXTRACT_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--input-docx",
             str(fixture_docx),
             "--output-dir",

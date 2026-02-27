@@ -6,18 +6,20 @@ description: Build writer-facing before/after change reports from patch and appl
 # DOCX Change Report (Before/After)
 
 Input paths:
+- Project root: `--project-dir projects/<project_slug>`
 - `artifacts/docx_extract/review_units.json`
 - `artifacts/patch/merged_patch.json`
 - `artifacts/apply/apply_log.json`
 
 Output paths:
-- `output/changes.md`
-- `output/changes.json`
+- `projects/<project_slug>/output/changes.md`
+- `projects/<project_slug>/output/changes.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_change_report_before_after/scripts/change_report.py \
+  --project-dir projects/thesis \
   --review-units artifacts/docx_extract/review_units.json \
   --patch artifacts/patch/merged_patch.json \
   --apply-log artifacts/apply/apply_log.json \

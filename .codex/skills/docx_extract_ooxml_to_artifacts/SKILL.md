@@ -6,18 +6,20 @@ description: Extract DOCX OOXML paragraph units from core document parts into de
 # DOCX Extract (OOXML -> Artifacts)
 
 Input path:
-- DOCX file passed by CLI argument: `--input-docx /absolute/or/relative/path/to/file.docx`
+- Project root: `--project-dir projects/<project_slug>`
+- DOCX file passed by CLI argument: `--input-docx input/source.docx` (project-relative unless absolute)
 
 Output paths:
-- `artifacts/docx_extract/review_units.json`
-- `artifacts/docx_extract/docx_struct.json`
-- `artifacts/docx_extract/linear_units.json`
+- `projects/<project_slug>/artifacts/docx_extract/review_units.json`
+- `projects/<project_slug>/artifacts/docx_extract/docx_struct.json`
+- `projects/<project_slug>/artifacts/docx_extract/linear_units.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py \
-  --input-docx fixtures/example.docx \
+  --project-dir projects/thesis \
+  --input-docx input/source.docx \
   --output-dir artifacts/docx_extract
 ```
 

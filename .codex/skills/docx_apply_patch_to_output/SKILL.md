@@ -6,18 +6,20 @@ description: Apply merged patch operations to DOCX output using track changes an
 # DOCX Apply Patch To Output
 
 Inputs:
+- Project root: `--project-dir projects/<project_slug>`
 - `input/source.docx`
 - `artifacts/patch/merged_patch.json`
 - `artifacts/docx_extract/review_units.json`
 
 Outputs:
-- `output/annotated.docx`
-- `artifacts/apply/apply_log.json`
+- `projects/<project_slug>/output/annotated.docx`
+- `projects/<project_slug>/artifacts/apply/apply_log.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_apply_patch_to_output/scripts/apply_docx_patch.py \
+  --project-dir projects/thesis \
   --input-docx input/source.docx \
   --patch artifacts/patch/merged_patch.json \
   --review-units artifacts/docx_extract/review_units.json \

@@ -8,16 +8,23 @@ from pathlib import Path
 
 from _merge_lib import (
     DEFAULT_AUTHOR,
-    DEFAULT_CHUNK_RESULTS_DIR,
-    DEFAULT_CHUNKS_MANIFEST_PATH,
-    DEFAULT_LINEAR_UNITS_PATH,
-    DEFAULT_OUTPUT_DIR,
     merge_chunk_results_to_artifacts,
 )
+
+DEFAULT_CHUNK_RESULTS_DIR = Path("artifacts/chunk_results")
+DEFAULT_LINEAR_UNITS_PATH = Path("artifacts/docx_extract/linear_units.json")
+DEFAULT_CHUNKS_MANIFEST_PATH = Path("artifacts/chunks/manifest.json")
+DEFAULT_OUTPUT_DIR = Path("artifacts/patch")
+
+
+def _resolve_project_path(project_dir: Path, raw_path: Path) -> Path:
+    expanded = raw_path.expanduser()
+    return expanded if expanded.is_absolute() else (project_dir / expanded)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-dir", type=Path, required=True, help="Project directory root")
     parser.add_argument(
         "--chunk-results-dir",
         type=Path,
@@ -54,23 +61,33 @@ def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if not args.chunk_results_dir.exists():
-        parser.error(f"chunk results directory not found: {args.chunk_results_dir}")
-    if not args.chunks_manifest.exists():
-        parser.error(f"chunks manifest not found: {args.chunks_manifest}")
+    project_dir = args.project_dir.expanduser().resolve()
+    if not project_dir.exists() or not project_dir.is_dir():
+        parser.error(f"--project-dir must be an existing directory: {project_dir}")
 
-    linear_units_path = args.linear_units if args.linear_units.exists() else None
+    chunk_results_dir = _resolve_project_path(project_dir, args.chunk_results_dir)
+    linear_units = _resolve_project_path(project_dir, args.linear_units)
+    chunks_manifest = _resolve_project_path(project_dir, args.chunks_manifest)
+    output_dir = _resolve_project_path(project_dir, args.output_dir)
+
+    if not chunk_results_dir.exists():
+        parser.error(f"chunk results directory not found: {chunk_results_dir}")
+    if not chunks_manifest.exists():
+        parser.error(f"chunks manifest not found: {chunks_manifest}")
+
+    linear_units_path = linear_units if linear_units.exists() else None
 
     result = merge_chunk_results_to_artifacts(
-        chunk_results_dir=args.chunk_results_dir,
-        output_dir=args.output_dir,
+        chunk_results_dir=chunk_results_dir,
+        output_dir=output_dir,
         linear_units_path=linear_units_path,
-        chunks_manifest_path=args.chunks_manifest,
+        chunks_manifest_path=chunks_manifest,
         author=str(args.author),
     )
 
     stats = result["stats"]
-    print(f"Chunk results dir: {args.chunk_results_dir}")
+    print(f"Project dir: {project_dir}")
+    print(f"Chunk results dir: {chunk_results_dir}")
     print(f"Chunk files read: {result['chunk_file_count']}")
     print(f"Wrote: {result['merged_patch_path']}")
     print(f"Wrote: {result['merge_report_path']}")

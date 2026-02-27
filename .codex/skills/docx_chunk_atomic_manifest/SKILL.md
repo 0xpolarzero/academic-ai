@@ -6,18 +6,20 @@ description: Build atomic DOCX review chunks and a manifest with editable primar
 # DOCX Chunking (Atomic Manifest)
 
 Input paths:
+- Project root: `--project-dir projects/<project_slug>`
 - `artifacts/docx_extract/review_units.json`
 - `artifacts/docx_extract/linear_units.json`
 - `artifacts/docx_extract/docx_struct.json` (optional)
 
 Output paths:
-- `artifacts/chunks/manifest.json`
-- `artifacts/chunks/chunk_XXXX.json`
+- `projects/<project_slug>/artifacts/chunks/manifest.json`
+- `projects/<project_slug>/artifacts/chunks/chunk_XXXX.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_chunk_atomic_manifest/scripts/chunk_docx.py \
+  --project-dir projects/thesis \
   --review-units artifacts/docx_extract/review_units.json \
   --linear-units artifacts/docx_extract/linear_units.json \
   --output-dir artifacts/chunks

@@ -26,10 +26,14 @@ def _run_merge(
     output_dir: Path,
     author: str = "merge-test",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    project_dir = output_dir.parent
+    project_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             sys.executable,
             str(MERGE_SCRIPT),
+            "--project-dir",
+            str(project_dir),
             "--chunk-results-dir",
             str(chunk_results_dir),
             "--linear-units",

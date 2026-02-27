@@ -6,19 +6,23 @@ description: Merge chunk result ops into a single validated patch with determini
 # DOCX Merge + Dedup + Validate Patch
 
 Input paths:
+- Project root: `--project-dir projects/<project_slug>`
 - `artifacts/chunk_results/chunk_XXXX_result.json`
 - `artifacts/docx_extract/linear_units.json` (optional, used for document-order sorting)
+- `artifacts/chunks/manifest.json`
 
 Output paths:
-- `artifacts/patch/merged_patch.json`
-- `artifacts/patch/merge_report.json`
+- `projects/<project_slug>/artifacts/patch/merged_patch.json`
+- `projects/<project_slug>/artifacts/patch/merge_report.json`
 
 Run:
 
 ```bash
 python .codex/skills/docx_merge_dedup_validate_patch/scripts/merge_patch.py \
+  --project-dir projects/thesis \
   --chunk-results-dir artifacts/chunk_results \
   --linear-units artifacts/docx_extract/linear_units.json \
+  --chunks-manifest artifacts/chunks/manifest.json \
   --output-dir artifacts/patch \
   --author "docx_merge_dedup_validate_patch"
 ```
