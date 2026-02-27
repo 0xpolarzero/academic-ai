@@ -399,7 +399,7 @@ def _parse_paragraph_index(unit: dict[str, Any]) -> int | None:
 
         path_hint = location.get("path_hint")
         if isinstance(path_hint, str):
-            match = re.search(r"\\.//w:p\[(\d+)\]", path_hint)
+            match = re.search(r"\.//w:p\[(\d+)\]", path_hint)
             if match:
                 parsed = int(match.group(1)) - 1
                 if parsed >= 0:

@@ -79,7 +79,16 @@ def _build_minimal_docx(path: Path, text: str) -> None:
             zf.writestr(part_name, payload)
 
 
-def _build_review_units(path: Path, text: str) -> None:
+def _build_review_units(path: Path, text: str, *, include_paragraph_index: bool = True) -> None:
+    location = {
+        "part_index": 0,
+        "global_order_index": 0,
+        "path_hint": "word/document.xml::.//w:p[1]",
+        "in_table": False,
+    }
+    if include_paragraph_index:
+        location["paragraph_index_in_part"] = 0
+
     _write_json(
         path,
         {
@@ -96,13 +105,34 @@ def _build_review_units(path: Path, text: str) -> None:
                     "accepted_text": text,
                     "heading_path": [],
                     "order_index": 0,
-                    "location": {
-                        "part_index": 0,
-                        "paragraph_index_in_part": 0,
-                        "global_order_index": 0,
-                        "path_hint": "word/document.xml::.//w:p[1]",
-                        "in_table": False,
+                    "location": location,
+                }
+            ],
+        },
+    )
+
+
+def _build_replace_only_patch(path: Path, text: str) -> None:
+    replace_start = text.index("beta")
+    replace_end = replace_start + len("beta")
+
+    _write_json(
+        path,
+        {
+            "schema_version": "patch.v1",
+            "created_at": "2026-02-27T00:00:00Z",
+            "author": "test",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": {
+                        "part": "word/document.xml",
+                        "para_id": "para_test",
+                        "unit_uid": "unit_test",
                     },
+                    "range": {"start": replace_start, "end": replace_end},
+                    "expected": {"snippet": "beta"},
+                    "replacement": "BETA",
                 }
             ],
         },
@@ -328,3 +358,41 @@ def test_apply_patch_skips_on_expected_snippet_mismatch(tmp_path: Path) -> None:
     assert op_entry["status"] == "skipped"
     assert op_entry["reason"] == "snippet_mismatch"
     assert op_entry["actual_snippet"] == "beta"
+
+
+def test_apply_patch_uses_path_hint_when_paragraph_index_is_missing(tmp_path: Path) -> None:
+    base_text = "Alpha beta gamma delta."
+
+    source_docx = tmp_path / "source.docx"
+    patch_path = tmp_path / "artifacts/patch/merged_patch.json"
+    review_units_path = tmp_path / "artifacts/docx_extract/review_units.json"
+    output_docx = tmp_path / "output/annotated.docx"
+    apply_log = tmp_path / "artifacts/apply/apply_log.json"
+
+    _build_minimal_docx(source_docx, base_text)
+    _build_replace_only_patch(patch_path, base_text)
+    _build_review_units(review_units_path, base_text, include_paragraph_index=False)
+
+    _run_apply(
+        source_docx=source_docx,
+        patch_path=patch_path,
+        review_units_path=review_units_path,
+        output_docx=output_docx,
+        apply_log=apply_log,
+    )
+
+    with zipfile.ZipFile(output_docx, mode="r") as zf:
+        assert zf.testzip() is None, "Output DOCX is not a valid zip package"
+        document_root = ET.fromstring(zf.read("word/document.xml"))
+
+    assert document_root.find(".//w:ins", NS) is not None
+    assert document_root.find(".//w:del", NS) is not None
+
+    log_payload = json.loads(apply_log.read_text(encoding="utf-8"))
+    assert log_payload["stats"]["input_ops"] == 1
+    assert log_payload["stats"]["applied_ops"] == 1
+    assert log_payload["stats"]["skipped_ops"] == 0
+
+    op_entry = log_payload["ops"][0]
+    assert op_entry["status"] == "applied"
+    assert op_entry["resolved_target"]["paragraph_index_in_part"] == 0
