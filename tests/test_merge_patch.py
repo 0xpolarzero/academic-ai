@@ -235,3 +235,85 @@ def test_merge_patch_dedup_conflict_downgrade_and_ordering(tmp_path: Path) -> No
     for starts in starts_by_target.values():
         assert starts == sorted(starts, reverse=True), "Ops must be descending by range.start per target"
 
+
+def test_merge_patch_conflict_detected_when_unit_uid_missing(tmp_path: Path) -> None:
+    chunk_results_dir = tmp_path / "chunk_results"
+    output_dir = tmp_path / "patch"
+    linear_units_path = tmp_path / "docx_extract/linear_units.json"
+
+    target_with_uid = {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"}
+    target_without_uid = {"part": "word/document.xml", "para_id": "para_1"}
+
+    _write_json(
+        chunk_results_dir / "chunk_0001_result.json",
+        {
+            "schema_version": "chunk_result.v1",
+            "chunk_id": "chunk_0001",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": target_with_uid,
+                    "range": {"start": 4, "end": 9},
+                    "expected": {"snippet": "beta"},
+                    "replacement": "BETA",
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        chunk_results_dir / "chunk_0002_result.json",
+        {
+            "schema_version": "chunk_result.v1",
+            "chunk_id": "chunk_0002",
+            "ops": [
+                {
+                    "type": "delete_range",
+                    "target": target_without_uid,
+                    "range": {"start": 6, "end": 8},
+                    "expected": {"snippet": "ta"},
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        linear_units_path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 1,
+            "unit_count": 1,
+            "unit_uids": ["unit_1"],
+            "units": ["unit_1"],
+            "order": [
+                {
+                    "order_index": 0,
+                    "part": "word/document.xml",
+                    "part_kind": "body",
+                    "part_name": "document",
+                    "para_id": "para_1",
+                    "unit_uid": "unit_1",
+                }
+            ],
+        },
+    )
+
+    merged_patch, merge_report = _run_merge(
+        chunk_results_dir=chunk_results_dir,
+        linear_units_path=linear_units_path,
+        output_dir=output_dir,
+        author="merge-test",
+    )
+
+    assert merge_report["stats"]["conflict_downgrades"] == 1
+
+    merged_ops = merged_patch["ops"]
+    assert len(merged_ops) == 2
+
+    assert len([op for op in merged_ops if op["type"] == "replace_range"]) == 1
+    assert not [op for op in merged_ops if op["type"] == "delete_range"]
+
+    downgraded = next(op for op in merged_ops if op["type"] == "add_comment")
+    assert "Conflict downgrade" in downgraded["comment_text"]
+    assert "replacement" not in downgraded
+    assert "new_text" not in downgraded

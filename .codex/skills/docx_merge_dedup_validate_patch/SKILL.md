@@ -32,11 +32,10 @@ Behavior:
   - `range`
   - normalized `expected.snippet` (old text)
   - normalized `replacement` / `new_text` / `comment_text`
-- Detects conflicts within the same target (`part + para_id + unit_uid?`):
+- Detects conflicts within the same paragraph target (`part + para_id`, regardless of `unit_uid` presence):
   - overlapping edits
   - contradictory replacements or insertions at the same range
 - Resolves conflicts safely by downgrading conflicting edit ops to `add_comment`.
 - Orders merged ops:
   - document order from `linear_units.json` when available
   - descending `range.start` within each target (safe for end-to-start application).
-

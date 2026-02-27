@@ -113,6 +113,14 @@ def _target_key(op: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _target_para_key(op: dict[str, Any]) -> tuple[str, str]:
+    target = op["target"]
+    return (
+        str(target.get("part", "")),
+        str(target.get("para_id", "")),
+    )
+
+
 def _same_range(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return left["range"]["start"] == right["range"]["start"] and left["range"]["end"] == right["range"]["end"]
 
@@ -422,12 +430,14 @@ def merge_chunk_results_to_artifacts(
         )
 
     resolved_ops: list[dict[str, Any]] = []
-    accepted_by_target: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    # Group conflicts by paragraph identity so mixed presence/absence of unit_uid
+    # cannot allow overlapping edits to pass silently.
+    accepted_by_para: dict[tuple[str, str], list[dict[str, Any]]] = {}
     conflicts: list[dict[str, Any]] = []
 
     for op in deduped_ops:
-        key = _target_key(op)
-        prior_ops = accepted_by_target.setdefault(key, [])
+        para_key = _target_para_key(op)
+        prior_ops = accepted_by_para.setdefault(para_key, [])
 
         if op["type"] not in EDIT_OP_TYPES:
             prior_ops.append(op)
@@ -524,4 +534,3 @@ def merge_chunk_results_to_artifacts(
         "chunk_file_count": len(chunk_files),
         "stats": merge_report_payload["stats"],
     }
-
