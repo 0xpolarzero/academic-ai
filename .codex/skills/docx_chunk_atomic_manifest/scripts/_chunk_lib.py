@@ -474,6 +474,30 @@ def chunk_docx_to_artifacts(
                 "primary_unit_uids": [unit["unit_uid"] for unit in chunk_payload["primary_units"]],
                 "context_before_unit_uids": [unit["unit_uid"] for unit in chunk_payload["context_units_before"]],
                 "context_after_unit_uids": [unit["unit_uid"] for unit in chunk_payload["context_units_after"]],
+                "primary_targets": [
+                    {
+                        "part": unit.get("part"),
+                        "para_id": unit.get("para_id"),
+                        "unit_uid": unit.get("unit_uid"),
+                    }
+                    for unit in chunk_payload["primary_units"]
+                ],
+                "context_targets_before": [
+                    {
+                        "part": unit.get("part"),
+                        "para_id": unit.get("para_id"),
+                        "unit_uid": unit.get("unit_uid"),
+                    }
+                    for unit in chunk_payload["context_units_before"]
+                ],
+                "context_targets_after": [
+                    {
+                        "part": unit.get("part"),
+                        "para_id": unit.get("para_id"),
+                        "unit_uid": unit.get("unit_uid"),
+                    }
+                    for unit in chunk_payload["context_units_after"]
+                ],
             }
         )
 

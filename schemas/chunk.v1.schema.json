@@ -7,9 +7,12 @@
   "required": [
     "schema_version",
     "chunk_id",
-    "accepted_text",
+    "chunk_index",
+    "contract",
     "primary_units",
-    "context_units"
+    "context_units_before",
+    "context_units_after",
+    "metadata"
   ],
   "properties": {
     "schema_version": {
@@ -19,9 +22,12 @@
       "type": "string",
       "minLength": 1
     },
-    "accepted_text": {
-      "type": "string",
-      "description": "Canonical chunk text used for all range offsets."
+    "chunk_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "contract": {
+      "$ref": "#/$defs/contract"
     },
     "primary_units": {
       "type": "array",
@@ -30,48 +36,88 @@
       },
       "minItems": 1
     },
-    "context_units": {
+    "context_units_before": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/context_unit"
+        "$ref": "#/$defs/context_before_unit"
+      }
+    },
+    "context_units_after": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/context_after_unit"
       }
     },
     "metadata": {
-      "type": "object",
-      "additionalProperties": true
+      "$ref": "#/$defs/metadata"
     }
   },
   "$defs": {
-    "range": {
+    "contract": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "start",
-        "end"
+        "primary_units_editable",
+        "context_units_editable",
+        "context_is_read_only",
+        "enforcement"
       ],
       "properties": {
-        "start": {
-          "type": "integer",
-          "minimum": 0
+        "primary_units_editable": {
+          "type": "boolean"
         },
-        "end": {
-          "type": "integer",
-          "minimum": 0
+        "context_units_editable": {
+          "type": "boolean"
+        },
+        "context_is_read_only": {
+          "type": "boolean"
+        },
+        "enforcement": {
+          "type": "string",
+          "minLength": 1
         }
-      },
-      "description": "UTF-16 code unit offsets in accepted_text (start inclusive, end exclusive)."
+      }
     },
-    "unit_ref": {
+    "location": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "heading_path": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "chunk_unit": {
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "part",
+        "part_kind",
+        "part_name",
         "para_id",
         "unit_uid",
+        "accepted_text",
+        "heading_path",
+        "order_index",
+        "location",
         "role",
-        "range",
-        "text"
+        "editable",
+        "token_estimate"
       ],
       "properties": {
+        "part": {
+          "type": "string",
+          "minLength": 1
+        },
+        "part_kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "part_name": {
+          "type": "string",
+          "minLength": 1
+        },
         "para_id": {
           "type": "string",
           "minLength": 1
@@ -80,51 +126,212 @@
           "type": "string",
           "minLength": 1
         },
+        "accepted_text": {
+          "type": "string"
+        },
+        "heading_path": {
+          "$ref": "#/$defs/heading_path"
+        },
+        "order_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
         "role": {
           "enum": [
             "primary",
-            "context"
+            "context_before",
+            "context_after"
           ]
         },
-        "range": {
-          "$ref": "#/$defs/range"
+        "editable": {
+          "type": "boolean"
         },
-        "text": {
-          "type": "string"
-        },
-        "source": {
-          "type": "object",
-          "additionalProperties": true
+        "token_estimate": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
     "primary_unit": {
       "allOf": [
         {
-          "$ref": "#/$defs/unit_ref"
+          "$ref": "#/$defs/chunk_unit"
         },
         {
           "properties": {
             "role": {
               "const": "primary"
+            },
+            "editable": {
+              "const": true
             }
           }
         }
       ]
     },
-    "context_unit": {
+    "context_before_unit": {
       "allOf": [
         {
-          "$ref": "#/$defs/unit_ref"
+          "$ref": "#/$defs/chunk_unit"
         },
         {
           "properties": {
             "role": {
-              "const": "context"
+              "const": "context_before"
+            },
+            "editable": {
+              "const": false
             }
           }
         }
       ]
+    },
+    "context_after_unit": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/chunk_unit"
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "context_after"
+            },
+            "editable": {
+              "const": false
+            }
+          }
+        }
+      ]
+    },
+    "source_span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_linear_index",
+        "end_linear_index",
+        "start_order_index",
+        "end_order_index",
+        "primary_unit_count",
+        "context_before_count",
+        "context_after_count",
+        "requested_overlap_before",
+        "requested_overlap_after",
+        "context_trimmed_for_budget"
+      ],
+      "properties": {
+        "start_linear_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_linear_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_order_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_order_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "primary_unit_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "context_before_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context_after_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requested_overlap_before": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "requested_overlap_after": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context_trimmed_for_budget": {
+          "type": "boolean"
+        }
+      }
+    },
+    "token_estimates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_tokens",
+        "context_before_tokens",
+        "context_after_tokens",
+        "total_tokens",
+        "target_tokens",
+        "hard_max_tokens",
+        "is_within_hard_max",
+        "allowed_overflow"
+      ],
+      "properties": {
+        "primary_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "context_before_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context_after_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "target_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hard_max_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "is_within_hard_max": {
+          "type": "boolean"
+        },
+        "allowed_overflow": {
+          "type": "boolean"
+        },
+        "overflow_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "heading_path",
+        "source_span",
+        "token_estimates"
+      ],
+      "properties": {
+        "heading_path": {
+          "$ref": "#/$defs/heading_path"
+        },
+        "source_span": {
+          "$ref": "#/$defs/source_span"
+        },
+        "token_estimates": {
+          "$ref": "#/$defs/token_estimates"
+        }
+      }
     }
   }
 }
