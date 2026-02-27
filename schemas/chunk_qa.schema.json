@@ -18,7 +18,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["type", "left_chunk_id", "right_chunk_id"],
+        "required": ["type", "left_chunk_id", "right_chunk_id", "move_primary_units"],
         "properties": {
           "type": {
             "type": "string",

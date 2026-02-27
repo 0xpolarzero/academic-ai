@@ -3,7 +3,7 @@
   "$id": "https://academic-ai.local/schemas/chunk_result.schema.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["chunk_id", "ops"],
+  "required": ["chunk_id", "suggestions", "ops"],
   "properties": {
     "chunk_id": { "type": "string", "minLength": 1 },
     "suggestions": {
@@ -14,7 +14,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["type", "target", "expected"],
         "properties": {
           "type": {
@@ -47,10 +47,7 @@
             "properties": {
               "snippet": { "type": "string" }
             }
-          },
-          "replacement": { "type": "string" },
-          "new_text": { "type": "string" },
-          "comment_text": { "type": "string", "minLength": 1 }
+          }
         }
       }
     }

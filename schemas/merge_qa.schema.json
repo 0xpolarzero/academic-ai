@@ -3,7 +3,7 @@
   "$id": "https://academic-ai.local/schemas/merge_qa.schema.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["actions"],
+  "required": ["notes", "actions"],
   "properties": {
     "notes": {
       "type": "array",
@@ -13,16 +13,14 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["type", "op_index"],
         "properties": {
           "type": {
             "type": "string",
             "enum": ["drop_op", "downgrade_to_comment"]
           },
-          "op_id": { "type": "string" },
-          "op_index": { "type": "integer", "minimum": 0 },
-          "comment_text": { "type": "string" }
+          "op_index": { "type": "integer", "minimum": 0 }
         }
       }
     }

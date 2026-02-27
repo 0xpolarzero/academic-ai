@@ -10,6 +10,6 @@
     <rule>Use fixes only when strictly necessary.</rule>
   </rules>
   <output_contract>
-    <json_object>{"status":"ok|needs_fix","issues":["..."],"fixes":[{"type":"merge_adjacent","left_chunk_id":"...","right_chunk_id":"..."},{"type":"shift_boundary","left_chunk_id":"...","right_chunk_id":"...","move_primary_units":1}]}</json_object>
+    <json_object>{"status":"ok|needs_fix","issues":["..."],"fixes":[{"type":"merge_adjacent","left_chunk_id":"...","right_chunk_id":"...","move_primary_units":0},{"type":"shift_boundary","left_chunk_id":"...","right_chunk_id":"...","move_primary_units":1}]}</json_object>
   </output_contract>
 </chunk_qa_prompt>
