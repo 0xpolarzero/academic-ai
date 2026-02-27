@@ -209,6 +209,10 @@ def test_chunk_manifest_contract(tmp_path: Path) -> None:
             assert allowed_overflow, f"{chunk_path.name} exceeded hard max without controlled overflow"
             assert len(chunk["primary_units"]) == 1
             assert token_estimates["primary_tokens"] > hard_max_tokens
+            assert chunk["context_units_before"] == []
+            assert chunk["context_units_after"] == []
+            assert token_estimates["context_before_tokens"] == 0
+            assert token_estimates["context_after_tokens"] == 0
             saw_allowed_overflow = True
         else:
             assert not allowed_overflow, f"{chunk_path.name} incorrectly marked overflow"

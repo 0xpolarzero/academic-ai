@@ -321,9 +321,16 @@ def _build_chunk_payload(
 
     primary_tokens = sum(unit_tokens[index] for index in primary_indices)
 
+    # Keep overflow controlled: when a single primary unit is already oversized,
+    # remove overlap context so non-primary units never contribute to overflow.
+    context_trimmed_for_budget = False
+    if primary_tokens > budget.hard_max_tokens and (before_indices or after_indices):
+        before_indices = []
+        after_indices = []
+        context_trimmed_for_budget = True
+
     # Keep nearest overlap units by default, but trim farthest context units if needed
     # so regular chunks remain within hard max budget.
-    context_trimmed_for_budget = False
     while True:
         context_before_tokens = sum(unit_tokens[index] for index in before_indices)
         context_after_tokens = sum(unit_tokens[index] for index in after_indices)
