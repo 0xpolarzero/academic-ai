@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["type"],
+        "required": ["type", "op_index"],
         "properties": {
           "type": {
             "type": "string",
@@ -23,28 +23,7 @@
           "op_id": { "type": "string" },
           "op_index": { "type": "integer", "minimum": 0 },
           "comment_text": { "type": "string" }
-        },
-        "allOf": [
-          {
-            "if": { "properties": { "type": { "const": "drop_op" } }, "required": ["type"] },
-            "then": {
-              "anyOf": [
-                { "required": ["op_id"] },
-                { "required": ["op_index"] }
-              ]
-            }
-          },
-          {
-            "if": { "properties": { "type": { "const": "downgrade_to_comment" } }, "required": ["type"] },
-            "then": {
-              "required": ["comment_text"],
-              "anyOf": [
-                { "required": ["op_id"] },
-                { "required": ["op_index"] }
-              ]
-            }
-          }
-        ]
+        }
       }
     }
   }

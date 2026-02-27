@@ -18,7 +18,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["type"],
+        "required": ["type", "left_chunk_id", "right_chunk_id"],
         "properties": {
           "type": {
             "type": "string",
@@ -27,17 +27,7 @@
           "left_chunk_id": { "type": "string", "minLength": 1 },
           "right_chunk_id": { "type": "string", "minLength": 1 },
           "move_primary_units": { "type": "integer" }
-        },
-        "allOf": [
-          {
-            "if": { "properties": { "type": { "const": "merge_adjacent" } }, "required": ["type"] },
-            "then": { "required": ["left_chunk_id", "right_chunk_id"] }
-          },
-          {
-            "if": { "properties": { "type": { "const": "shift_boundary" } }, "required": ["type"] },
-            "then": { "required": ["left_chunk_id", "right_chunk_id", "move_primary_units"] }
-          }
-        ]
+        }
       }
     }
   }

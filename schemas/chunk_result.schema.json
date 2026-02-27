@@ -51,21 +51,7 @@
           "replacement": { "type": "string" },
           "new_text": { "type": "string" },
           "comment_text": { "type": "string", "minLength": 1 }
-        },
-        "allOf": [
-          {
-            "if": { "properties": { "type": { "const": "replace_range" } }, "required": ["type"] },
-            "then": { "required": ["replacement"] }
-          },
-          {
-            "if": { "properties": { "type": { "const": "insert_at" } }, "required": ["type"] },
-            "then": { "required": ["new_text"] }
-          },
-          {
-            "if": { "properties": { "type": { "const": "add_comment" } }, "required": ["type"] },
-            "then": { "required": ["comment_text"] }
-          }
-        ]
+        }
       }
     }
   }
