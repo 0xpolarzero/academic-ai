@@ -1,0 +1,35 @@
+{
+  "schema_versions": {
+    "chunk": "v1",
+    "patch": "v1",
+    "chunk_result": "v1"
+  },
+  "chunking": {
+    "paths": {
+      "review_units": "artifacts/docx_extract/review_units.json",
+      "linear_units": "artifacts/docx_extract/linear_units.json",
+      "docx_struct": "artifacts/docx_extract/docx_struct.json",
+      "output_dir": "artifacts/chunks"
+    },
+    "token_budget": {
+      "model_context_window": 128000,
+      "target_fraction": 0.35,
+      "hard_max_tokens": 56000,
+      "overlap_before_units": 1,
+      "overlap_after_units": 1,
+      "tokenizer_model": "gpt-4o-mini"
+    }
+  },
+  "id_scheme": {
+    "paragraph_key": "para_id",
+    "unit_key": "unit_uid",
+    "composite_format": "{para_id}::{unit_uid}",
+    "composite_delimiter": "::"
+  },
+  "offset_semantics": {
+    "reference_text": "accepted_text",
+    "indexing": "utf16_code_unit",
+    "start_inclusive": true,
+    "end_exclusive": true
+  }
+}
