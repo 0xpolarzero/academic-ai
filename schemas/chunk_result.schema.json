@@ -15,7 +15,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["type", "target", "expected", "range"],
+        "required": ["type", "target", "expected", "range", "replacement", "new_text", "comment_text"],
         "properties": {
           "type": {
             "type": "string",
@@ -47,6 +47,15 @@
             "properties": {
               "snippet": { "type": "string" }
             }
+          },
+          "replacement": {
+            "type": "string"
+          },
+          "new_text": {
+            "type": "string"
+          },
+          "comment_text": {
+            "type": "string"
           }
         }
       }

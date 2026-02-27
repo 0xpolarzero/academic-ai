@@ -9,13 +9,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import itertools
 import copy
+import os
 from pathlib import Path
 import json
 import re
+import select
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
+from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +41,18 @@ SCHEMA_MERGE_QA = REPO_ROOT / "schemas/merge_qa.schema.json"
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
 VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at", "delete_range"}
 EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
+CODEX_EXEC_TIMEOUT_SECONDS = 600
+
+ANSI_RESET = "\033[0m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+ANSI_BLUE = "\033[34m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_MAGENTA = "\033[35m"
+ANSI_GREEN = "\033[32m"
+
+_RUN_LOG_FH: TextIO | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +85,27 @@ class SyntheticChunkResult:
     op_count: int
 
 
+def _init_run_log(path: Path) -> None:
+    global _RUN_LOG_FH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _RUN_LOG_FH = path.open("w", encoding="utf-8", buffering=1)
+
+
+def _close_run_log() -> None:
+    global _RUN_LOG_FH
+    if _RUN_LOG_FH is not None:
+        _RUN_LOG_FH.close()
+        _RUN_LOG_FH = None
+
+
+def _log_line(message: str, *, stderr: bool = False) -> None:
+    stream = sys.stderr if stderr else sys.stdout
+    print(message, file=stream, flush=True)
+    if _RUN_LOG_FH is not None:
+        _RUN_LOG_FH.write(message + "\n")
+        _RUN_LOG_FH.flush()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True, help="Project slug under projects/")
@@ -91,11 +128,61 @@ def _dump_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _run(cmd: list[str]) -> None:
-    print("$", " ".join(cmd))
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
+    _log_line("$ " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        _log_line(line.rstrip())
+    returncode = proc.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode=returncode, cmd=cmd)
 
 
-def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path) -> None:
+def _colors_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(sys.stdout.isatty())
+
+
+def _colorize_codemsg(line: str) -> str:
+    if not _colors_enabled():
+        return line
+
+    lower = line.strip().lower()
+    if not lower:
+        return line
+    if lower.startswith("error") or "invalid schema" in lower or "failed" in lower:
+        return f"{ANSI_RED}{line}{ANSI_RESET}"
+    if lower.startswith("warning") or lower.startswith("deprecated"):
+        return f"{ANSI_YELLOW}{line}{ANSI_RESET}"
+    if lower == "thinking" or lower.startswith("**"):
+        return f"{ANSI_MAGENTA}{line}{ANSI_RESET}"
+    if lower.startswith("codex"):
+        return f"{ANSI_CYAN}{line}{ANSI_RESET}"
+    if lower.startswith("user"):
+        return f"{ANSI_BLUE}{line}{ANSI_RESET}"
+    if lower.startswith("exec"):
+        return f"{ANSI_GREEN}{line}{ANSI_RESET}"
+    if lower.startswith("tokens used") or lower.startswith("openai codex"):
+        return f"{ANSI_DIM}{line}{ANSI_RESET}"
+    return line
+
+
+def _phase_prefix(phase: str) -> str:
+    base = f"[{phase}]"
+    if not _colors_enabled():
+        return base
+    return f"{ANSI_DIM}{base}{ANSI_RESET}"
+
+
+def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "codex",
@@ -110,11 +197,62 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path) -> Non
         str(output_path),
         "-",
     ]
-    print("$", " ".join(cmd))
+    _log_line("$ " + " ".join(cmd))
     try:
-        subprocess.run(cmd, cwd=REPO_ROOT, input=prompt.encode("utf-8"), check=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
     except FileNotFoundError as exc:
         raise RuntimeError("codex CLI was not found on PATH") from exc
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+
+        deadline = time.monotonic() + CODEX_EXEC_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                raise RuntimeError(
+                    f"codex exec timed out after {CODEX_EXEC_TIMEOUT_SECONDS}s during {phase}. "
+                    f"Output target: {output_path}"
+                )
+
+            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip())}")
+                    continue
+
+            if proc.poll() is not None:
+                break
+
+        tail = proc.stdout.read()
+        if tail:
+            for line in tail.splitlines():
+                _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line)}")
+
+        returncode = proc.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(
+                returncode=returncode,
+                cmd=cmd,
+            )
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        raise
 
 
 def _render_template(path: Path, replacements: dict[str, str]) -> str:
@@ -402,7 +540,12 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
             "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
         },
     )
-    _run_codex_exec(prompt=prompt, schema_path=SCHEMA_CHUNK_QA, output_path=paths.chunk_qa_report)
+    _run_codex_exec(
+        prompt=prompt,
+        schema_path=SCHEMA_CHUNK_QA,
+        output_path=paths.chunk_qa_report,
+        phase="chunk QA pass 1",
+    )
     first_report = _load_json(paths.chunk_qa_report)
 
     status = str(first_report.get("status", "")).strip()
@@ -436,7 +579,12 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
             "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
         },
     )
-    _run_codex_exec(prompt=second_prompt, schema_path=SCHEMA_CHUNK_QA, output_path=paths.chunk_qa_report)
+    _run_codex_exec(
+        prompt=second_prompt,
+        schema_path=SCHEMA_CHUNK_QA,
+        output_path=paths.chunk_qa_report,
+        phase="chunk QA pass 2",
+    )
     second_report = _load_json(paths.chunk_qa_report)
     second_status = str(second_report.get("status", "")).strip()
     if second_status != "ok":
@@ -642,7 +790,7 @@ def _sanitize_chunk_result_ops(
 
     fallback_target = {"part": first_primary[0], "para_id": first_primary[1], "unit_uid": first_primary[2]}
 
-    def comment_op(reason: str, *, from_op: dict[str, Any] | None) -> dict[str, Any]:
+    def conversion_meta(reason: str, *, from_op: dict[str, Any] | None) -> dict[str, Any]:
         target = fallback_target
         rng = {"start": 0, "end": 0}
         snippet = ""
@@ -658,11 +806,10 @@ def _sanitize_chunk_result_ops(
             if isinstance(maybe_expected, dict):
                 snippet = str(maybe_expected.get("snippet", ""))
         return {
-            "type": "add_comment",
+            "reason": reason,
             "target": target,
             "range": rng,
-            "expected": {"snippet": snippet},
-            "comment_text": f"Sanitized op in {chunk_id}: {reason}.",
+            "expected_snippet": snippet,
         }
 
     raw_ops = raw_payload.get("ops", [])
@@ -675,14 +822,12 @@ def _sanitize_chunk_result_ops(
 
     for idx, raw_op in enumerate(raw_ops):
         if not isinstance(raw_op, dict):
-            sanitized_ops.append(comment_op("op was not an object", from_op=None))
-            converted.append({"op_index": idx, "reason": "non_object_op"})
+            converted.append({"op_index": idx, **conversion_meta("non_object_op", from_op=None)})
             continue
 
         op_type = str(raw_op.get("type", "")).strip()
         if op_type not in VALID_OP_TYPES:
-            sanitized_ops.append(comment_op(f"unsupported type {op_type!r}", from_op=raw_op))
-            converted.append({"op_index": idx, "reason": "invalid_type"})
+            converted.append({"op_index": idx, **conversion_meta("invalid_type", from_op=raw_op)})
             continue
 
         target = raw_op.get("target")
@@ -695,8 +840,7 @@ def _sanitize_chunk_result_ops(
                 key = (part, para_id, candidates[0])
 
         if key is None or key not in primary_targets:
-            sanitized_ops.append(comment_op("target is not in primary_units", from_op=raw_op))
-            converted.append({"op_index": idx, "reason": "non_primary_target"})
+            converted.append({"op_index": idx, **conversion_meta("non_primary_target", from_op=raw_op)})
             continue
 
         normalized_target = {"part": key[0], "para_id": key[1], "unit_uid": key[2]}
@@ -719,24 +863,30 @@ def _sanitize_chunk_result_ops(
 
         if op_type == "replace_range":
             if "replacement" not in raw_op:
-                sanitized_ops.append(comment_op("replace_range missing replacement", from_op=raw_op))
-                converted.append({"op_index": idx, "reason": "missing_replacement"})
+                converted.append({"op_index": idx, **conversion_meta("missing_replacement", from_op=raw_op)})
                 continue
-            sanitized["replacement"] = str(raw_op.get("replacement"))
+            replacement = str(raw_op.get("replacement", ""))
+            if replacement == "":
+                converted.append({"op_index": idx, **conversion_meta("empty_replacement", from_op=raw_op)})
+                continue
+            sanitized["replacement"] = replacement
         elif op_type == "insert_at":
             if normalized_range is not None and normalized_range["start"] != normalized_range["end"]:
-                sanitized_ops.append(comment_op("insert_at requires collapsed range", from_op=raw_op))
-                converted.append({"op_index": idx, "reason": "insert_non_collapsed_range"})
+                converted.append({"op_index": idx, **conversion_meta("insert_non_collapsed_range", from_op=raw_op)})
                 continue
             if "new_text" not in raw_op:
-                sanitized_ops.append(comment_op("insert_at missing new_text", from_op=raw_op))
-                converted.append({"op_index": idx, "reason": "missing_new_text"})
+                converted.append({"op_index": idx, **conversion_meta("missing_new_text", from_op=raw_op)})
                 continue
-            sanitized["new_text"] = str(raw_op.get("new_text"))
+            new_text = str(raw_op.get("new_text", ""))
+            if new_text == "":
+                converted.append({"op_index": idx, **conversion_meta("empty_new_text", from_op=raw_op)})
+                continue
+            sanitized["new_text"] = new_text
         elif op_type == "add_comment":
             comment_text = str(raw_op.get("comment_text", "")).strip()
             if not comment_text:
-                comment_text = f"Sanitized comment placeholder for {chunk_id}."
+                converted.append({"op_index": idx, **conversion_meta("missing_comment_text", from_op=raw_op)})
+                continue
             sanitized["comment_text"] = comment_text
         elif op_type == "delete_range":
             pass
@@ -779,6 +929,8 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
         stale.unlink()
     for stale in paths.chunk_results_dir.glob("chunk_*_sanitization.json"):
         stale.unlink()
+    for stale in paths.chunk_results_dir.glob("chunk_*_result.raw.json"):
+        stale.unlink()
 
     def process_chunk(entry: dict[str, Any]) -> dict[str, Any]:
         chunk_id = str(entry.get("chunk_id", "")).strip()
@@ -791,16 +943,24 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
             raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
 
         output_path = paths.chunk_results_dir / f"{chunk_id}_result.json"
+        workflow_xml = paths.workflow_xml.read_text(encoding="utf-8")
         prompt = _render_template(
             TEMPLATE_CHUNK_REVIEW,
             {
-                "WORKFLOW_XML_PATH": str(paths.workflow_xml),
+                "WORKFLOW_XML": workflow_xml,
                 "CHUNK_PATH": str(chunk_path.resolve()),
             },
         )
-        _run_codex_exec(prompt=prompt, schema_path=SCHEMA_CHUNK_REVIEW, output_path=output_path)
+        _log_line(f"Chunk review start: {chunk_id}")
+        _run_codex_exec(
+            prompt=prompt,
+            schema_path=SCHEMA_CHUNK_REVIEW,
+            output_path=output_path,
+            phase=f"chunk review {chunk_id}",
+        )
 
         raw_payload = _load_json(output_path)
+        _dump_json(paths.chunk_results_dir / f"{chunk_id}_result.raw.json", raw_payload)
         chunk_payload = _load_json(chunk_path)
         sanitized_payload, log_payload = _sanitize_chunk_result_ops(
             chunk_id=chunk_id,
@@ -823,8 +983,18 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [executor.submit(process_chunk, entry) for entry in chunk_entries if isinstance(entry, dict)]
+        completed = 0
+        total = len(futures)
         for future in as_completed(futures):
-            summaries.append(future.result())
+            summary = future.result()
+            summaries.append(summary)
+            completed += 1
+            _log_line(
+                "Chunk review done: "
+                f"{summary['chunk_id']} "
+                f"({completed}/{total}) "
+                f"input_ops={summary['input_ops']} output_ops={summary['output_ops']} converted={summary['converted_ops']}"
+            )
 
     summaries.sort(key=lambda item: str(item.get("chunk_id", "")))
     aggregate = {
@@ -836,6 +1006,36 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
     }
     _dump_json(paths.chunk_result_sanitization_log, aggregate)
     return aggregate
+
+
+def _enforce_no_sanitized_chunk_ops(paths: ProjectPaths, review_summary: dict[str, Any]) -> None:
+    converted_total = int(review_summary.get("total_converted_ops", 0))
+    if converted_total <= 0:
+        return
+
+    chunk_items = review_summary.get("chunks", [])
+    offenders: list[str] = []
+    if isinstance(chunk_items, list):
+        for item in chunk_items:
+            if not isinstance(item, dict):
+                continue
+            converted = int(item.get("converted_ops", 0))
+            if converted <= 0:
+                continue
+            chunk_id = str(item.get("chunk_id", "unknown")).strip() or "unknown"
+            offenders.append(f"{chunk_id} ({converted})")
+
+    offender_preview = ", ".join(offenders[:8]) if offenders else "unknown"
+    if len(offenders) > 8:
+        offender_preview += f", ... (+{len(offenders) - 8} more)"
+
+    raise RuntimeError(
+        "Invalid chunk review ops detected "
+        f"(converted_ops={converted_total}). "
+        "Failing run before merge/apply to avoid silent degradation. "
+        f"Offending chunks: {offender_preview}. "
+        f"See {paths.chunk_result_sanitization_log}"
+    )
 
 
 def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
@@ -935,7 +1135,12 @@ def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str) -> dict[str, 
             "MERGE_REPORT_PATH": str(paths.merge_report),
         },
     )
-    _run_codex_exec(prompt=prompt, schema_path=SCHEMA_MERGE_QA, output_path=paths.merge_qa_report)
+    _run_codex_exec(
+        prompt=prompt,
+        schema_path=SCHEMA_MERGE_QA,
+        output_path=paths.merge_qa_report,
+        phase="merge QA",
+    )
 
     merge_qa = _load_json(paths.merge_qa_report)
     actions = merge_qa.get("actions", [])
@@ -1059,18 +1264,19 @@ def run_pipeline(
     synthetic: SyntheticChunkResult | None = None
     if dry_run:
         synthetic = _discover_synthetic_chunk_result(paths)
-        print(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
+        _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
     else:
         qa = _run_chunk_qa_with_optional_fix(paths)
-        print(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
+        _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
         review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency)
-        print(
+        _log_line(
             "Chunk reviews complete: "
             f"chunks={review_summary['chunk_count']} "
             f"input_ops={review_summary['total_input_ops']} "
             f"output_ops={review_summary['total_output_ops']} "
             f"converted={review_summary['total_converted_ops']}"
         )
+        _enforce_no_sanitized_chunk_ops(paths, review_summary)
 
     _run(
         [
@@ -1109,7 +1315,7 @@ def run_pipeline(
         )
     else:
         override_report = _apply_merge_qa_overrides(paths, author=author)
-        print(
+        _log_line(
             "Merge QA overrides: "
             f"actions_in={override_report['actions_in']} "
             f"applied={override_report['actions_applied']} "
@@ -1166,9 +1372,12 @@ def run_pipeline(
 
 def main() -> int:
     args = _build_parser().parse_args()
+    log_started = False
 
     try:
         paths = _resolve_paths(args)
+        _init_run_log(paths.project_dir / "artifacts" / "last_run.txt")
+        log_started = True
         _ensure_project_prereqs(paths)
 
         for stale in [
@@ -1193,22 +1402,28 @@ def main() -> int:
             max_concurrency=int(args.max_concurrency),
         )
 
-        print("Project run completed successfully.")
-        print(f"Project: {paths.project_dir}")
-        print(f"Workflow: {paths.workflow_xml.name}")
-        print(f"Final patch: {paths.final_patch}")
-        print(f"Annotated DOCX: {paths.annotated_docx}")
-        print(f"Change report: {paths.changes_md}")
+        _log_line("Project run completed successfully.")
+        _log_line(f"Project: {paths.project_dir}")
+        _log_line(f"Workflow: {paths.workflow_xml.name}")
+        _log_line(f"Final patch: {paths.final_patch}")
+        _log_line(f"Annotated DOCX: {paths.annotated_docx}")
+        _log_line(f"Change report: {paths.changes_md}")
         if synthetic is not None:
-            print(f"Dry-run synthetic chunk result: {synthetic.output_path}")
+            _log_line(f"Dry-run synthetic chunk result: {synthetic.output_path}")
 
         return 0
+    except KeyboardInterrupt:
+        if log_started:
+            _log_line("Run interrupted by user (SIGINT).", stderr=True)
+        return 130
     except subprocess.CalledProcessError as exc:
-        print(f"Command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)
+        _log_line(f"Command failed with exit code {exc.returncode}: {exc.cmd}", stderr=True)
         return exc.returncode
     except Exception as exc:
-        print(f"Project run failed: {exc}", file=sys.stderr)
+        _log_line(f"Project run failed: {exc}", stderr=True)
         return 1
+    finally:
+        _close_run_log()
 
 
 if __name__ == "__main__":

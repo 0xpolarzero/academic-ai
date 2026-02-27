@@ -14,7 +14,7 @@
     "token_budget": {
       "model_context_window": 128000,
       "target_fraction": 0.35,
-      "hard_max_tokens": 8192,
+      "hard_max_tokens": 2048,
       "overlap_before_units": 1,
       "overlap_after_units": 1,
       "tokenizer_model": "gpt-4o-mini"

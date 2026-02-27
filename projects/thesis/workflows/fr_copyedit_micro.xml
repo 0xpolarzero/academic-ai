@@ -1,24 +1,43 @@
-<workflow name="fr_copyedit_micro" version="1">
-  <locale>fr-FR</locale>
-  <profile>copyedit</profile>
-  <pass>secondary</pass>
-  <policy>
-    <meaning_preservation>strict</meaning_preservation>
-    <rephrase_if_obscure_only>false</rephrase_if_obscure_only>
-    <micro_clarity_rephrase_allowed>true</micro_clarity_rephrase_allowed>
-    <redo_copyedit_tasks>false</redo_copyedit_tasks>
-  </policy>
-  <operations>
-    <grammar>false</grammar>
-    <agreement>false</agreement>
-    <spelling>false</spelling>
-    <punctuation>false</punctuation>
-    <typography>false</typography>
-    <micro_clarity>true</micro_clarity>
-  </operations>
-  <constraints>
-    <minimal_edits>true</minimal_edits>
-    <no_tone_shift>true</no_tone_shift>
-    <no_structural_rewrite>true</no_structural_rewrite>
-  </constraints>
+<workflow name="fr_micro_improvements_only" version="1">
+  <purpose>
+    Second-pass ONLY: suggest micro-improvements that clearly improve readability/clarity
+    without changing meaning. This workflow is intended to run AFTER the conservative
+    copyedit workflow, and MUST NOT redo basic proofreading tasks.
+  </purpose>
+
+  <non_negotiables>
+    <item>Never apply silent edits. All proposed text changes must be suggestions only (track changes).</item>
+    <item>Anchor comments to the smallest relevant span possible.</item>
+    <item>Meaning preservation is strict: do not change claims, nuance, scope, chronology, agency, modality, or hedging.</item>
+    <item>Do not introduce new terminology, new facts, or new interpretations.</item>
+    <item>Do not alter numbers, dates, citations, footnote content, or bibliographic references unless your change is purely formatting-neutral AND unquestionably safe; otherwise add a comment.</item>
+    <item>If there is any uncertainty about meaning or author intent, do NOT rephrase; add a comment instead.</item>
+  </non_negotiables>
+
+  <allowed_changes>
+    <item>Micro rephrasing that increases clarity while preserving meaning (e.g., removing a local ambiguity, improving a clunky construction, fixing a confusing pronoun reference).</item>
+    <item>Very small syntactic adjustments (e.g., word order, agreement-preserving restructuring) that do not change emphasis or nuance.</item>
+    <item>Splitting an overly long sentence into two if it improves readability and does not change logical relations.</item>
+    <item>Light tightening (removing a redundant phrase) ONLY if it does not remove nuance.</item>
+  </allowed_changes>
+
+  <explicitly_not_in_scope>
+    <item>Do not perform full proofreading or copyediting (spelling/grammar/typos/repetitions/typography/bibliography verification). Assume the conservative pass covers that.</item>
+    <item>Do not rewrite for style preference, elegance, tone, or rhetorical strength.</item>
+    <item>Do not “improve” academic positioning (e.g., stronger claims, weaker claims, added caveats) — that changes meaning/stance.</item>
+    <item>Do not global-harmonize terminology or capitalization in this pass; if you notice an issue, leave a comment.</item>
+  </explicitly_not_in_scope>
+
+  <decision_rule>
+    Propose a micro-improvement ONLY if you are highly confident it (1) clarifies the passage,
+    (2) preserves meaning exactly, and (3) does not introduce any new ambiguity.
+    Otherwise: add a comment describing the potential improvement and the risk/uncertainty.
+  </decision_rule>
+
+  <how_to_express_suggestions>
+    <item>Prefer the smallest possible change (micro-diff).</item>
+    <item>When proposing a rephrase, keep the original terminology and register.</item>
+    <item>When in doubt between edit vs comment: choose comment.</item>
+    <item>For each suggestion, include a short rationale focused on clarity (not taste).</item>
+  </how_to_express_suggestions>
 </workflow>

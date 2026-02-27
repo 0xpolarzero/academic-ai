@@ -1,23 +1,32 @@
 <workflow name="fr_copyedit_conservative" version="1">
-  <locale>fr-FR</locale>
-  <profile>copyedit</profile>
-  <pass>primary</pass>
-  <policy>
-    <meaning_preservation>strict</meaning_preservation>
-    <rephrase_if_obscure_only>true</rephrase_if_obscure_only>
-    <redo_copyedit_tasks>false</redo_copyedit_tasks>
-  </policy>
-  <operations>
-    <grammar>true</grammar>
-    <agreement>true</agreement>
-    <spelling>true</spelling>
-    <punctuation>true</punctuation>
-    <typography>true</typography>
-    <style>false</style>
-  </operations>
-  <constraints>
-    <minimal_edits>true</minimal_edits>
-    <no_tone_shift>true</no_tone_shift>
-    <no_structural_rewrite>true</no_structural_rewrite>
-  </constraints>
+  <purpose>
+    French academic copyedit with strict meaning preservation.
+    Do NOT propose rephrasing unless a sentence is truly too obscure.
+  </purpose>
+
+  <non_negotiables>
+    <item>Never apply silent edits. All edits must be suggestions only (track changes).</item>
+    <item>Anchor comments to the smallest relevant span possible.</item>
+    <item>If uncertain, prefer a comment over an edit.</item>
+  </non_negotiables>
+
+  <tasks>
+    <item>Correct errors in all forms: spelling, conjugation, typos, missing words inferred from meaning, missing conjunctions, and tense agreement issues within a paragraph.</item>
+    <item>Identify repetitions and suggest alternatives/synonyms that do not create a new repetition with another nearby word in the text.</item>
+    <item>Check French agreement with respect to the German word: agree French terms according to the grammatical gender of the German word (e.g., “Mittelgebirge”). If unsure, add a comment instead of editing.</item>
+    <item>List words/phrases that can be removed without changing the meaning. Often overused adverbs (e.g., “en particulier”, “notamment”) when they add no real nuance; also redundant phrases (e.g., “de l’empire” in the provided example).</item>
+    <item>Ensure consistency in typographic standards within the chapter.</item>
+    <item>Check footnotes. Verify online that cited bibliographic references are correct when feasible; otherwise, comment what to verify.</item>
+    <item>Verify numerical consistency (internal contradictions or mismatched figures).</item>
+    <item>Flag if a footnote contains no reference or indicates that a reference must be added.</item>
+    <item>Correct German terms and other foreign-language terms, including inside bibliographic references.</item>
+    <item>Check punctuation; consistent uppercase/lowercase (especially plant names: harmonize across the document by searching similar occurrences); harmonize alternative spellings (e.g., “chaînes de commodités” vs “chaînes de commodité”).</item>
+    <item>Flag inconsistencies in cross-references to figures.</item>
+    <item>List archival call numbers cited in the chapter in a single paragraph (to facilitate the “sources” section of the bibliography).</item>
+  </tasks>
+
+  <rephrasing_policy>
+    Do not propose rewording except when a sentence is truly too obscure.
+    In that case, propose the smallest possible rewrite that preserves meaning.
+  </rephrasing_policy>
 </workflow>

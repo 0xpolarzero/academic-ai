@@ -1,13 +1,21 @@
 <chunk_review_prompt>
   <role>You are reviewing one DOCX chunk and proposing patch ops.</role>
   <inputs>
-    <workflow_xml_path>{{WORKFLOW_XML_PATH}}</workflow_xml_path>
     <chunk_path>{{CHUNK_PATH}}</chunk_path>
+    <workflow_definition>
+{{WORKFLOW_XML}}
+    </workflow_definition>
   </inputs>
   <rules>
     <rule>Return valid JSON only, matching the provided output schema.</rule>
     <rule>Target only primary_units from the chunk payload.</rule>
     <rule>All edit/comment ops must include expected.snippet.</rule>
     <rule>Include range for every op. Use conservative ranges only when confident.</rule>
+    <rule>For each op object, always include all three fields: replacement, new_text, comment_text.</rule>
+    <rule>For unused fields set empty string "".</rule>
+    <rule>If type=replace_range, replacement must be non-empty and exact intended replacement text.</rule>
+    <rule>If type=insert_at, new_text must be non-empty; range.start must equal range.end.</rule>
+    <rule>If type=add_comment, comment_text must be non-empty reviewer comment.</rule>
+    <rule>If you cannot provide a safe replacement/new_text, emit add_comment instead of replace_range/insert_at.</rule>
   </rules>
 </chunk_review_prompt>
