@@ -13,7 +13,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["type", "op_index"],
         "properties": {
           "type": {
