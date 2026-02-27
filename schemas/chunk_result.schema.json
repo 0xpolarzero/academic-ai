@@ -14,8 +14,8 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true,
-        "required": ["type", "target", "expected"],
+        "additionalProperties": false,
+        "required": ["type", "target", "expected", "range"],
         "properties": {
           "type": {
             "type": "string",

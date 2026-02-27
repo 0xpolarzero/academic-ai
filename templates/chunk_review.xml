@@ -8,6 +8,6 @@
     <rule>Return valid JSON only, matching the provided output schema.</rule>
     <rule>Target only primary_units from the chunk payload.</rule>
     <rule>All edit/comment ops must include expected.snippet.</rule>
-    <rule>range may be omitted. Never invent uncertain offsets.</rule>
+    <rule>Include range for every op. Use conservative ranges only when confident.</rule>
   </rules>
 </chunk_review_prompt>
