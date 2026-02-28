@@ -25,7 +25,7 @@ help:
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
 	@echo "  make report    # patch/apply -> output/changes.{md,json}"
 	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
-	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [DRY_RUN=1]  # run project workflow"
+	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [DRY_RUN=1] [CLI=codex|kimi]  # run project workflow"
 	@echo "  make test      # pytest unit + integration checks"
 	@echo "  make e2e       # offline thesis dry-run + acceptance checks"
 
@@ -59,10 +59,14 @@ run:
 		fi; \
 	fi
 	@DRY_FLAG=""; \
-	if [ -z "$(DRY_RUN)" ] || [ "$(DRY_RUN)" = "1" ] || [ "$(DRY_RUN)" = "true" ] || [ "$(DRY_RUN)" = "yes" ]; then \
+	if [ -n "$(DRY_RUN)" ] && [ "$(DRY_RUN)" != "0" ] && [ "$(DRY_RUN)" != "false" ] && [ "$(DRY_RUN)" != "no" ]; then \
 		DRY_FLAG="--dry-run"; \
 	fi; \
-	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$DRY_FLAG
+	CLI_FLAG=""; \
+	if [ -n "$(CLI)" ]; then \
+		CLI_FLAG="--cli $(CLI)"; \
+	fi; \
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$DRY_FLAG $$CLI_FLAG
 
 fixtures:
 	@mkdir -p fixtures

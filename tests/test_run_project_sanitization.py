@@ -172,7 +172,7 @@ def test_strict_gate_allows_clean_review_summary():
     run_project._enforce_no_sanitized_chunk_ops(fake_paths, review_summary)
 
 
-def test_sanitizer_rejects_empty_replacement_and_empty_new_text():
+def test_sanitizer_converts_empty_replacement_to_delete_range_and_rejects_empty_new_text():
     run_project = _load_run_project_module()
 
     chunk_payload = {
@@ -218,8 +218,11 @@ def test_sanitizer_rejects_empty_replacement_and_empty_new_text():
         chunk_payload=chunk_payload,
     )
 
-    assert sanitized["ops"] == []
+    # Empty replacement is converted to delete_range (real deletion op)
+    assert len(sanitized["ops"]) == 1
+    assert sanitized["ops"][0]["type"] == "delete_range"
+    assert "replacement" not in sanitized["ops"][0]
     assert [item["reason"] for item in log["conversions"]] == [
-        "empty_replacement",
+        "empty_replacement_to_delete_range",
         "empty_new_text",
     ]

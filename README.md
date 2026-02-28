@@ -117,7 +117,7 @@ make test
   --workflow fr_copyedit_conservative
 ```
 
-Use `--dry-run` to avoid Codex calls and generate synthetic chunk review outputs:
+Use `--dry-run` to avoid CLI calls and generate synthetic chunk review outputs:
 
 ```bash
 .venv/bin/python scripts/run_project.py \
@@ -126,12 +126,28 @@ Use `--dry-run` to avoid Codex calls and generate synthetic chunk review outputs
   --dry-run
 ```
 
+Use `--cli` to select the CLI provider (`codex` or `kimi`, default is `codex`):
+
+```bash
+.venv/bin/python scripts/run_project.py \
+  --project thesis \
+  --workflow fr_copyedit_conservative \
+  --cli kimi
+```
+
+Or via make:
+
+```bash
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative CLI=kimi
+```
+
 ## Troubleshooting
 
 - `Workflow XML not found`: create or verify `projects/<project>/workflows/<workflow>.xml`.
 - `Workflow name mismatch`: ensure workflow root has `<workflow name="<workflow>">`.
 - `Source DOCX not found`: place file at `projects/<project>/input/source.docx`.
 - `codex CLI was not found on PATH`: install/configure Codex CLI or run with `--dry-run`.
+- `kimi CLI was not found on PATH`: install Kimi CLI (https://moonshotai.github.io/kimi-cli/) or run with `--dry-run`.
 - `Chunk QA still failing after deterministic fixes`: inspect `projects/<project>/artifacts/chunks/chunk_qa_report.json`.
 - `Missing output files`: inspect `projects/<project>/artifacts/patch/merge_report.json` and `projects/<project>/artifacts/apply/apply_log.json`.
 

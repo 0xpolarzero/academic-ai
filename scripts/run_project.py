@@ -23,6 +23,8 @@ from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+CLI_EXEC_TIMEOUT_SECONDS = 600
+
 EXTRACT_SCRIPT = REPO_ROOT / ".codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py"
 CHUNK_SCRIPT = REPO_ROOT / ".codex/skills/docx_chunk_atomic_manifest/scripts/chunk_docx.py"
 MERGE_SCRIPT = REPO_ROOT / ".codex/skills/docx_merge_dedup_validate_patch/scripts/merge_patch.py"
@@ -38,10 +40,17 @@ SCHEMA_CHUNK_QA = REPO_ROOT / "schemas/chunk_qa.schema.json"
 SCHEMA_CHUNK_REVIEW = REPO_ROOT / "schemas/chunk_result.schema.json"
 SCHEMA_MERGE_QA = REPO_ROOT / "schemas/merge_qa.schema.json"
 
+
+def _load_schema_content(schema_path: Path) -> str:
+    """Load JSON schema content for inclusion in prompts."""
+    try:
+        return schema_path.read_text(encoding="utf-8")
+    except Exception:
+        return "{}"
+
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
 VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at", "delete_range"}
 EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
-CODEX_EXEC_TIMEOUT_SECONDS = 600
 
 ANSI_RESET = "\033[0m"
 ANSI_DIM = "\033[2m"
@@ -112,9 +121,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workflow", required=True, help="Workflow name in projects/<project>/workflows/<name>.xml")
     parser.add_argument("--constants", type=Path, default=Path("config/constants.json"), help="Path to constants JSON")
     parser.add_argument("--author", default="phase4-runner", help="Author value used in merge/apply artifacts")
-    parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk Codex reviewers")
+    parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk reviewers")
     parser.add_argument("--dry-run", action="store_true", help="Generate synthetic chunk results instead of model outputs")
     parser.add_argument("--skip-validation", action="store_true", help="Skip QA acceptance checks at the end")
+    parser.add_argument("--cli", default="codex", choices=("codex", "kimi"), help="CLI provider to use for AI calls (default: codex)")
     return parser
 
 
@@ -151,7 +161,7 @@ def _colors_enabled() -> bool:
     return bool(sys.stdout.isatty())
 
 
-def _colorize_codemsg(line: str) -> str:
+def _colorize_codemsg(line: str, cli: str = "codex") -> str:
     if not _colors_enabled():
         return line
 
@@ -164,7 +174,7 @@ def _colorize_codemsg(line: str) -> str:
         return f"{ANSI_YELLOW}{line}{ANSI_RESET}"
     if lower == "thinking" or lower.startswith("**"):
         return f"{ANSI_MAGENTA}{line}{ANSI_RESET}"
-    if lower.startswith("codex"):
+    if lower.startswith(cli.lower()):
         return f"{ANSI_CYAN}{line}{ANSI_RESET}"
     if lower.startswith("user"):
         return f"{ANSI_BLUE}{line}{ANSI_RESET}"
@@ -182,9 +192,29 @@ def _phase_prefix(phase: str) -> str:
     return f"{ANSI_DIM}{base}{ANSI_RESET}"
 
 
-def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
+def _build_cli_command(cli: str, *, prompt: str, schema_path: Path, output_path: Path) -> list[str]:
+    """Build CLI command based on the selected provider."""
+    if cli == "kimi":
+        # For Kimi, we include the schema in the prompt since it doesn't have
+        # built-in schema enforcement like Codex
+        schema_content = _load_schema_content(schema_path)
+        enhanced_prompt = f"""{prompt}
+
+<output_schema>
+{schema_content}
+</output_schema>
+
+CRITICAL: You must output ONLY valid JSON matching the schema above. Do not output any explanatory text, markdown formatting, or conversational content. Output raw JSON only."""
+        return [
+            "kimi",
+            "--work-dir", str(REPO_ROOT),
+            "--yolo",
+            "--print",
+            "--output-format", "stream-json",
+            "--prompt", enhanced_prompt,
+        ]
+    # Default to codex
+    return [
         "codex",
         "exec",
         "--cd",
@@ -197,7 +227,85 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase:
         str(output_path),
         "-",
     ]
-    _log_line("$ " + " ".join(cmd))
+
+
+def _extract_kimi_raw_text(lines: list[str]) -> str:
+    """Extract raw text content from Kimi stream-json output.
+    
+    Collects all text content from assistant messages to pass to codex spark
+    for structured JSON extraction.
+    
+    Returns:
+        Concatenated text from all assistant messages
+    """
+    text_parts: list[str] = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict) and parsed.get("role") == "assistant":
+                content = parsed.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text:
+                                text_parts.append(text)
+                elif isinstance(content, str):
+                    text_parts.append(content)
+        except json.JSONDecodeError:
+            continue
+    
+    return "".join(text_parts)
+
+
+def _extract_json_via_spark(*, raw_text: str, schema_path: Path, phase: str) -> dict[str, Any] | None:
+    """Use Codex Spark to convert conversational text into valid JSON.
+    
+    All kimi output is passed through codex spark with structured output
+    to ensure consistent JSON parsing. Codex enforces the output schema.
+    """
+    schema_content = _load_schema_content(schema_path)
+    
+    spark_prompt = f"""You are a JSON extraction specialist. Your task is to convert the following text into valid JSON that conforms exactly to the provided schema.
+
+<instructions>
+1. Read the text content below which describes some operations/changes.
+2. Extract the relevant information and format it as valid JSON matching the schema.
+3. Ensure all required fields from the schema are present.
+4. If the text describes operations (like edits or comments), put them in the "ops" array.
+5. Use empty strings "" for optional fields that aren't specified.
+</instructions>
+
+<output_schema>
+{schema_content}
+</output_schema>
+
+<text_content>
+{raw_text}
+</text_content>
+
+CRITICAL: Output ONLY valid JSON matching the schema."""
+
+    output_path = REPO_ROOT / f"artifacts/.spark_extract_{phase.replace(' ', '_')}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    cmd = [
+        "codex",
+        "exec",
+        "--model", "gpt-5.3-codex-spark",
+        "--cd", str(REPO_ROOT),
+        "--sandbox", "read-only",
+        "--output-schema", str(schema_path),
+        "--output-last-message", str(output_path),
+        "-",
+    ]
+    
+    _log_line(f"[{phase}] Extracting JSON via Codex Spark...")
+    
     try:
         proc = subprocess.Popen(
             cmd,
@@ -208,23 +316,141 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase:
             text=True,
             bufsize=1,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError("codex CLI was not found on PATH") from exc
+    except FileNotFoundError:
+        _log_line(f"[{phase}] ERROR: codex CLI not found for spark extraction")
+        return None
 
     assert proc.stdin is not None
     assert proc.stdout is not None
 
     try:
-        proc.stdin.write(prompt)
+        proc.stdin.write(spark_prompt)
         proc.stdin.close()
 
-        deadline = time.monotonic() + CODEX_EXEC_TIMEOUT_SECONDS
+        # Read output with timeout
+        deadline = time.monotonic() + 120  # 2 minutes
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                _log_line(f"[{phase}] Codex Spark extraction timed out")
+                return None
+
+            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    continue
+
+            if proc.poll() is not None:
+                break
+
+        # Wait for process to complete
+        returncode = proc.wait()
+        
+        # Read any remaining output
+        tail = proc.stdout.read()
+
+        if returncode != 0:
+            _log_line(f"[{phase}] Codex Spark extraction failed with exit code {returncode}")
+            return None
+
+        # Read the JSON output from file
+        if output_path.exists():
+            content = _load_json(output_path)
+            _log_line(f"[{phase}] Successfully extracted JSON via Codex Spark")
+            # Clean up temp file
+            output_path.unlink(missing_ok=True)
+            return content
+        else:
+            _log_line(f"[{phase}] Codex Spark output file not found")
+            return None
+        
+    except Exception as exc:
+        _log_line(f"[{phase}] Codex Spark extraction failed: {exc}")
+        if proc.poll() is None:
+            proc.kill()
+        return None
+    finally:
+        # Clean up temp file if it exists
+        output_path.unlink(missing_ok=True)
+
+
+def _normalize_kimi_ops(result: dict[str, Any], chunk_payload: dict[str, Any]) -> None:
+    """Normalize Kimi's output format to match the expected schema.
+    
+    - 'patch_ops' -> 'ops'
+    - 'target_unit_uid' -> 'target' with full unit info (part, para_id, unit_uid)
+    """
+    if not isinstance(result, dict):
+        return
+    
+    # Kimi may output 'patch_ops' but we expect 'ops'
+    if "patch_ops" in result and "ops" not in result:
+        result["ops"] = result.pop("patch_ops")
+    
+    # Build a map of unit_uid -> target for lookups
+    unit_uid_to_target: dict[str, dict[str, str]] = {}
+    primary_units = chunk_payload.get("primary_units", [])
+    if isinstance(primary_units, list):
+        for unit in primary_units:
+            if isinstance(unit, dict):
+                unit_uid = str(unit.get("unit_uid", "")).strip()
+                if unit_uid:
+                    unit_uid_to_target[unit_uid] = {
+                        "part": str(unit.get("part", "")).strip(),
+                        "para_id": str(unit.get("para_id", "")).strip(),
+                        "unit_uid": unit_uid,
+                    }
+    
+    # Normalize ops: Kimi uses 'target_unit_uid' but we expect 'target' object
+    ops = result.get("ops", [])
+    if isinstance(ops, list):
+        for op in ops:
+            if isinstance(op, dict) and "target_unit_uid" in op and "target" not in op:
+                unit_uid = str(op.pop("target_unit_uid", "")).strip()
+                if unit_uid in unit_uid_to_target:
+                    op["target"] = unit_uid_to_target[unit_uid]
+
+
+def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _build_cli_command(cli, prompt=prompt, schema_path=schema_path, output_path=output_path)
+    _log_line("$ " + " ".join(cmd[:6]) + (" ..." if cli == "kimi" else " ".join(cmd[6:])))
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            stdin=subprocess.DEVNULL if cli == "kimi" else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{cli} CLI was not found on PATH") from exc
+
+    assert proc.stdout is not None
+    if cli != "kimi":
+        assert proc.stdin is not None
+
+    # Buffer for JSON output in kimi mode
+    json_lines: list[str] = []
+
+    try:
+        # Only write to stdin for codex (kimi uses --prompt argument)
+        if cli != "kimi":
+            assert proc.stdin is not None
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+
+        deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 proc.kill()
                 raise RuntimeError(
-                    f"codex exec timed out after {CODEX_EXEC_TIMEOUT_SECONDS}s during {phase}. "
+                    f"{cli} exec timed out after {CLI_EXEC_TIMEOUT_SECONDS}s during {phase}. "
                     f"Output target: {output_path}"
                 )
 
@@ -232,7 +458,12 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase:
             if ready:
                 line = proc.stdout.readline()
                 if line:
-                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip())}")
+                    # For kimi in print mode, capture all output lines for JSON parsing
+                    if cli == "kimi":
+                        stripped = line.strip()
+                        if stripped:
+                            json_lines.append(stripped)
+                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip(), cli=cli)}")
                     continue
 
             if proc.poll() is not None:
@@ -241,7 +472,11 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase:
         tail = proc.stdout.read()
         if tail:
             for line in tail.splitlines():
-                _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line)}")
+                if cli == "kimi":
+                    stripped = line.strip()
+                    if stripped:
+                        json_lines.append(stripped)
+                _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line, cli=cli)}")
 
         returncode = proc.wait()
         if returncode != 0:
@@ -249,6 +484,33 @@ def _run_codex_exec(*, prompt: str, schema_path: Path, output_path: Path, phase:
                 returncode=returncode,
                 cmd=cmd,
             )
+
+        # For kimi mode, always extract JSON via Codex Spark
+        if cli == "kimi":
+            raw_text = _extract_kimi_raw_text(json_lines)
+            if not raw_text:
+                raw_output = "\n".join(json_lines)
+                output_path.write_text(raw_output, encoding="utf-8")
+                _log_line(f"[{phase}] ERROR: No text content found in kimi output")
+                raise RuntimeError(
+                    f"No text content found in {cli} output during {phase}. "
+                    f"Raw output saved to: {output_path}"
+                )
+            
+            content = _extract_json_via_spark(
+                raw_text=raw_text,
+                schema_path=schema_path,
+                phase=phase,
+            )
+            if content is None:
+                raw_output = "\n".join(json_lines)
+                output_path.write_text(raw_output, encoding="utf-8")
+                _log_line(f"[{phase}] ERROR: Codex Spark JSON extraction failed")
+                raise RuntimeError(
+                    f"Failed to extract valid JSON from {cli} output during {phase} via Codex Spark. "
+                    f"Raw output saved to: {output_path}"
+                )
+            output_path.write_text(json.dumps(content, indent=2), encoding="utf-8")
     except Exception:
         if proc.poll() is None:
             proc.kill()
@@ -518,7 +780,7 @@ def _apply_chunk_boundary_fixes(paths: ProjectPaths, fixes: list[dict[str, Any]]
     return {"applied_fixes": applied, "chunk_count": len(chunks)}
 
 
-def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
+def _run_chunk_qa_with_optional_fix(paths: ProjectPaths, *, cli: str) -> dict[str, Any]:
     manifest_path = paths.chunks_output_dir / "manifest.json"
     manifest = _load_json(manifest_path)
     chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
@@ -540,7 +802,8 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
             "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
         },
     )
-    _run_codex_exec(
+    _run_cli_exec(
+        cli=cli,
         prompt=prompt,
         schema_path=SCHEMA_CHUNK_QA,
         output_path=paths.chunk_qa_report,
@@ -579,7 +842,8 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths) -> dict[str, Any]:
             "SAMPLE_CHUNK_PATHS": "\n".join(sample_paths),
         },
     )
-    _run_codex_exec(
+    _run_cli_exec(
+        cli=cli,
         prompt=second_prompt,
         schema_path=SCHEMA_CHUNK_QA,
         output_path=paths.chunk_qa_report,
@@ -812,6 +1076,18 @@ def _sanitize_chunk_result_ops(
             "expected_snippet": snippet,
         }
 
+    # Build lookup map: unit_uid -> (part, para_id, unit_uid) from chunk's primary_units
+    # We ALWAYS use this for target resolution since unit_uid is the unique identifier
+    # This is deterministic and ignores any AI hallucinations in part/para_id fields
+    unit_uid_to_target: dict[str, tuple[str, str, str]] = {}
+    for unit in primary_units:
+        if isinstance(unit, dict):
+            uid = str(unit.get("unit_uid", "")).strip()
+            part = str(unit.get("part", "")).strip()
+            para_id = str(unit.get("para_id", "")).strip()
+            if uid and part and para_id:
+                unit_uid_to_target[uid] = (part, para_id, uid)
+
     raw_ops = raw_payload.get("ops", [])
     if not isinstance(raw_ops, list):
         raw_ops = []
@@ -830,16 +1106,16 @@ def _sanitize_chunk_result_ops(
             converted.append({"op_index": idx, **conversion_meta("invalid_type", from_op=raw_op)})
             continue
 
+        # ALWAYS resolve target using unit_uid from the AI's output
+        # but use the chunk's ground truth for part/para_id/unit_uid
         target = raw_op.get("target")
-        key = _target_key(target)
-        if key is None and isinstance(target, dict):
-            part = str(target.get("part", "")).strip()
-            para_id = str(target.get("para_id", "")).strip()
-            candidates = primary_by_para.get((part, para_id), [])
-            if len(candidates) == 1:
-                key = (part, para_id, candidates[0])
+        key = None
+        if isinstance(target, dict):
+            unit_uid = str(target.get("unit_uid", "")).strip()
+            if unit_uid in unit_uid_to_target:
+                key = unit_uid_to_target[unit_uid]  # Use chunk's ground truth
 
-        if key is None or key not in primary_targets:
+        if key is None:
             converted.append({"op_index": idx, **conversion_meta("non_primary_target", from_op=raw_op)})
             continue
 
@@ -867,7 +1143,13 @@ def _sanitize_chunk_result_ops(
                 continue
             replacement = str(raw_op.get("replacement", ""))
             if replacement == "":
-                converted.append({"op_index": idx, **conversion_meta("empty_replacement", from_op=raw_op)})
+                # Convert to delete_range - the reviewer intends to delete this text
+                sanitized["type"] = "delete_range"
+                if "replacement" in sanitized:
+                    del sanitized["replacement"]
+                converted.append({"op_index": idx, **conversion_meta("empty_replacement_to_delete_range", from_op=raw_op)})
+                sanitized_ops.append(sanitized)
+                kept += 1
                 continue
             sanitized["replacement"] = replacement
         elif op_type == "insert_at":
@@ -918,7 +1200,7 @@ def _sanitize_chunk_result_ops(
     return sanitized_payload, log_payload
 
 
-def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str, Any]:
+def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -> dict[str, Any]:
     manifest_path = paths.chunks_output_dir / "manifest.json"
     manifest = _load_json(manifest_path)
     chunk_entries = manifest.get("chunks", []) if isinstance(manifest, dict) else []
@@ -952,7 +1234,8 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
             },
         )
         _log_line(f"Chunk review start: {chunk_id}")
-        _run_codex_exec(
+        _run_cli_exec(
+            cli=cli,
             prompt=prompt,
             schema_path=SCHEMA_CHUNK_REVIEW,
             output_path=output_path,
@@ -962,6 +1245,10 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int) -> dict[str
         raw_payload = _load_json(output_path)
         _dump_json(paths.chunk_results_dir / f"{chunk_id}_result.raw.json", raw_payload)
         chunk_payload = _load_json(chunk_path)
+        
+        # Normalize Kimi's output format if needed
+        if cli == "kimi":
+            _normalize_kimi_ops(raw_payload, chunk_payload)
         sanitized_payload, log_payload = _sanitize_chunk_result_ops(
             chunk_id=chunk_id,
             raw_payload=raw_payload,
@@ -1127,7 +1414,7 @@ def _resolve_action_index(action: dict[str, Any], base_ops: list[dict[str, Any]]
     return None
 
 
-def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str) -> dict[str, Any]:
+def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str, cli: str) -> dict[str, Any]:
     prompt = _render_template(
         TEMPLATE_MERGE_QA,
         {
@@ -1135,7 +1422,8 @@ def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str) -> dict[str, 
             "MERGE_REPORT_PATH": str(paths.merge_report),
         },
     )
-    _run_codex_exec(
+    _run_cli_exec(
+        cli=cli,
         prompt=prompt,
         schema_path=SCHEMA_MERGE_QA,
         output_path=paths.merge_qa_report,
@@ -1228,6 +1516,7 @@ def run_pipeline(
     dry_run: bool,
     validate: bool,
     max_concurrency: int,
+    cli: str,
 ) -> SyntheticChunkResult | None:
     _run(
         [
@@ -1266,9 +1555,9 @@ def run_pipeline(
         synthetic = _discover_synthetic_chunk_result(paths)
         _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
     else:
-        qa = _run_chunk_qa_with_optional_fix(paths)
+        qa = _run_chunk_qa_with_optional_fix(paths, cli=cli)
         _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
-        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency)
+        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency, cli=cli)
         _log_line(
             "Chunk reviews complete: "
             f"chunks={review_summary['chunk_count']} "
@@ -1314,7 +1603,7 @@ def run_pipeline(
             },
         )
     else:
-        override_report = _apply_merge_qa_overrides(paths, author=author)
+        override_report = _apply_merge_qa_overrides(paths, author=author, cli=cli)
         _log_line(
             "Merge QA overrides: "
             f"actions_in={override_report['actions_in']} "
@@ -1400,6 +1689,7 @@ def main() -> int:
             dry_run=bool(args.dry_run),
             validate=not bool(args.skip_validation),
             max_concurrency=int(args.max_concurrency),
+            cli=str(args.cli),
         )
 
         _log_line("Project run completed successfully.")
