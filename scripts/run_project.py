@@ -23,6 +23,10 @@ from typing import TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Import unified CLI runner for claude/kimi support
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from unified_cli_runner import run_cli_exec, detect_available_cli, validate_claude_kimi_setup
+
 CLI_EXEC_TIMEOUT_SECONDS = 600
 
 EXTRACT_SCRIPT = REPO_ROOT / ".codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py"
@@ -49,7 +53,7 @@ def _load_schema_content(schema_path: Path) -> str:
         return "{}"
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
-VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at", "delete_range"}
+VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at"}
 EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
 
 ANSI_RESET = "\033[0m"
@@ -124,7 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk reviewers")
     parser.add_argument("--dry-run", action="store_true", help="Generate synthetic chunk results instead of model outputs")
     parser.add_argument("--skip-validation", action="store_true", help="Skip QA acceptance checks at the end")
-    parser.add_argument("--cli", default="codex", choices=("codex", "kimi"), help="CLI provider to use for AI calls (default: codex)")
+    parser.add_argument("--cli", default="codex", choices=("codex", "claude", "kimi"), help="CLI provider to use for AI calls: codex, claude (Claude Code), or kimi (default: codex)")
     return parser
 
 
@@ -414,107 +418,395 @@ def _normalize_kimi_ops(result: dict[str, Any], chunk_payload: dict[str, Any]) -
 
 
 def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
+    """Run CLI command using appropriate backend.
+    
+    - codex: Uses native --output-schema (most reliable)
+    - claude: Uses --json-schema for Anthropic models
+    - kimi: Uses validation and retry logic (no external dependency)
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = _build_cli_command(cli, prompt=prompt, schema_path=schema_path, output_path=output_path)
-    _log_line("$ " + " ".join(cmd[:6]) + (" ..." if cli == "kimi" else " ".join(cmd[6:])))
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=REPO_ROOT,
-            stdin=subprocess.DEVNULL if cli == "kimi" else subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+    
+    if cli == "kimi":
+        # Kimi uses validation/retry without Codex Spark dependency
+        _run_kimi_with_retry(
+            prompt=prompt,
+            schema_path=schema_path,
+            output_path=output_path,
+            phase=phase,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"{cli} CLI was not found on PATH") from exc
+    elif cli == "claude":
+        # Claude Code uses unified runner
+        def log_callback(msg: str, stderr: bool = False):
+            _log_line(msg, stderr=stderr)
+        from unified_cli_runner import run_cli_exec as _run_claude
+        _run_claude(
+            cli="claude",
+            prompt=prompt,
+            schema_path=schema_path,
+            output_path=output_path,
+            work_dir=REPO_ROOT,
+            phase=phase,
+            log_callback=log_callback,
+        )
+    else:
+        # Default codex (original behavior)
+        _run_codex(
+            prompt=prompt,
+            schema_path=schema_path,
+            output_path=output_path,
+            phase=phase,
+        )
 
-    assert proc.stdout is not None
-    if cli != "kimi":
-        assert proc.stdin is not None
 
-    # Buffer for JSON output in kimi mode
-    json_lines: list[str] = []
-
+def _run_codex(*, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
+    """Run Codex CLI with native structured output."""
+    cmd = [
+        "codex",
+        "exec",
+        "--cd", str(REPO_ROOT),
+        "--sandbox", "read-only",
+        "--output-schema", str(schema_path),
+        "--output-last-message", str(output_path),
+        "-",
+    ]
+    _log_line("$ " + " ".join(cmd))
+    
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    
     try:
-        # Only write to stdin for codex (kimi uses --prompt argument)
-        if cli != "kimi":
-            assert proc.stdin is not None
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+        
         deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 proc.kill()
-                raise RuntimeError(
-                    f"{cli} exec timed out after {CLI_EXEC_TIMEOUT_SECONDS}s during {phase}. "
-                    f"Output target: {output_path}"
-                )
-
+                raise RuntimeError(f"Codex timed out after {CLI_EXEC_TIMEOUT_SECONDS}s")
+            
             ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
             if ready:
                 line = proc.stdout.readline()
                 if line:
-                    # For kimi in print mode, capture all output lines for JSON parsing
-                    if cli == "kimi":
-                        stripped = line.strip()
-                        if stripped:
-                            json_lines.append(stripped)
-                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip(), cli=cli)}")
+                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip(), cli='codex')}")
                     continue
-
+            
             if proc.poll() is not None:
                 break
-
+        
         tail = proc.stdout.read()
         if tail:
             for line in tail.splitlines():
-                if cli == "kimi":
+                _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line, cli='codex')}")
+        
+        returncode = proc.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, cmd)
+        
+        if not output_path.exists():
+            raise RuntimeError(f"Codex did not create output file: {output_path}")
+            
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def _run_kimi_with_retry(*, prompt: str, schema_path: Path, output_path: Path, phase: str, max_retries: int = 2) -> None:
+    """Run Kimi CLI with validation and retry logic.
+    
+    Unlike the old implementation that used Codex Spark for extraction,
+    this version validates locally and retries with error feedback.
+    """
+    schema_content = _load_schema_content(schema_path)
+    schema = json.loads(schema_content) if schema_content else {}
+    
+    # Build initial prompt with strong JSON instructions
+    base_prompt = _build_kimi_structured_prompt(prompt, schema_content)
+    
+    current_prompt = base_prompt
+    last_errors: list[str] = []
+    last_raw_text: str = ""
+    
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            _log_line(f"[{phase}] Kimi retry attempt {attempt}/{max_retries} due to validation errors")
+            # Build retry prompt with error feedback
+            error_feedback = "\n".join(f"- {e}" for e in last_errors[:5])
+            current_prompt = f"""Your previous JSON output had validation errors. Fix them.
+
+Validation Errors:
+{error_feedback}
+
+Previous Output:
+```
+{last_raw_text[:4000]}
+```
+
+Original Task:
+{base_prompt}
+
+CRITICAL: Output ONLY valid JSON. Fix ALL validation errors above."""
+        
+        # Run Kimi
+        cmd = [
+            "kimi",
+            "--work-dir", str(REPO_ROOT),
+            "--yolo",
+            "--print",
+            "--output-format", "stream-json",
+            "--prompt", current_prompt,
+        ]
+        
+        _log_line(f"[{phase}] Running Kimi (attempt {attempt + 1}/{max_retries + 1})")
+        
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("kimi CLI was not found on PATH") from exc
+        
+        json_lines: list[str] = []
+        
+        try:
+            assert proc.stdout is not None
+            
+            deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    raise RuntimeError(f"Kimi timed out after {CLI_EXEC_TIMEOUT_SECONDS}s")
+                
+                ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+                if ready:
+                    line = proc.stdout.readline()
+                    if line:
+                        stripped = line.strip()
+                        if stripped:
+                            json_lines.append(stripped)
+                        _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line.rstrip(), cli='kimi')}")
+                        continue
+                
+                if proc.poll() is not None:
+                    break
+            
+            tail = proc.stdout.read()
+            if tail:
+                for line in tail.splitlines():
                     stripped = line.strip()
                     if stripped:
                         json_lines.append(stripped)
-                _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line, cli=cli)}")
-
-        returncode = proc.wait()
-        if returncode != 0:
-            raise subprocess.CalledProcessError(
-                returncode=returncode,
-                cmd=cmd,
-            )
-
-        # For kimi mode, always extract JSON via Codex Spark
-        if cli == "kimi":
-            raw_text = _extract_kimi_raw_text(json_lines)
-            if not raw_text:
-                raw_output = "\n".join(json_lines)
-                output_path.write_text(raw_output, encoding="utf-8")
-                _log_line(f"[{phase}] ERROR: No text content found in kimi output")
-                raise RuntimeError(
-                    f"No text content found in {cli} output during {phase}. "
-                    f"Raw output saved to: {output_path}"
-                )
+                    _log_line(f"{_phase_prefix(phase)} {_colorize_codemsg(line, cli='kimi')}")
             
-            content = _extract_json_via_spark(
-                raw_text=raw_text,
-                schema_path=schema_path,
-                phase=phase,
-            )
-            if content is None:
-                raw_output = "\n".join(json_lines)
-                output_path.write_text(raw_output, encoding="utf-8")
-                _log_line(f"[{phase}] ERROR: Codex Spark JSON extraction failed")
-                raise RuntimeError(
-                    f"Failed to extract valid JSON from {cli} output during {phase} via Codex Spark. "
-                    f"Raw output saved to: {output_path}"
-                )
-            output_path.write_text(json.dumps(content, indent=2), encoding="utf-8")
-    except Exception:
-        if proc.poll() is None:
-            proc.kill()
-        raise
+            returncode = proc.wait()
+            
+            # Extract text from kimi output
+            raw_text = _extract_kimi_text(json_lines)
+            last_raw_text = raw_text
+            
+            if not raw_text.strip():
+                last_errors = ["No text output from Kimi"]
+                if attempt < max_retries:
+                    continue
+                raise RuntimeError(f"No text content found in kimi output during {phase}")
+            
+            # Try to extract and validate JSON
+            parsed = _extract_json_from_text(raw_text)
+            if parsed is None:
+                last_errors = ["Could not parse valid JSON from output"]
+                if attempt < max_retries:
+                    continue
+                raise RuntimeError(f"Failed to parse JSON from kimi output during {phase}")
+            
+            # Validate against schema
+            validation_errors = _validate_against_schema(parsed, schema)
+            if validation_errors:
+                last_errors = validation_errors
+                if attempt < max_retries:
+                    continue
+                # Final attempt failed - save what we have but warn
+                _log_line(f"[{phase}] Warning: JSON validation failed after {max_retries + 1} attempts", stderr=True)
+                for err in validation_errors[:5]:
+                    _log_line(f"[{phase}]   - {err}", stderr=True)
+            
+            # Save the result (even if validation failed, we have best effort)
+            output_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+            _log_line(f"[{phase}] Kimi completed (validation: {'passed' if not validation_errors else 'failed'})")
+            return
+            
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    
+    # Should not reach here, but just in case
+    raise RuntimeError(f"Kimi failed after {max_retries + 1} attempts")
+
+
+def _build_kimi_structured_prompt(base_prompt: str, schema_content: str) -> str:
+    """Build a prompt that strongly encourages valid JSON output."""
+    return f"""You are a JSON-only API. Return ONLY valid JSON matching the schema below.
+
+=== TASK ===
+{base_prompt}
+
+=== SCHEMA ===
+{schema_content}
+
+=== RULES ===
+1. Output MUST be valid, parseable JSON
+2. Do NOT wrap in ```json code blocks - output raw JSON only
+3. Do NOT include explanations or conversational text
+4. Every required field must be present
+5. Use empty strings "" for optional fields you don't populate
+6. Use empty arrays [] for array fields with no items
+7. Property names must match the schema exactly (case-sensitive)
+8. All values must be the correct type (string, number, boolean, array, object)
+
+Output ONLY the JSON object, nothing else."""
+
+
+def _extract_kimi_text(lines: list[str]) -> str:
+    """Extract text content from Kimi stream-json output."""
+    text_parts: list[str] = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict) and parsed.get("role") == "assistant":
+                content = parsed.get("content", [])
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text:
+                                text_parts.append(text)
+                elif isinstance(content, str):
+                    text_parts.append(content)
+        except json.JSONDecodeError:
+            continue
+    
+    return "".join(text_parts)
+
+
+def _extract_json_from_text(text: str) -> dict[str, Any] | None:
+    """Try to extract JSON from text that might have markdown or extra content."""
+    text = text.strip()
+    
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Try removing markdown code blocks
+    import re
+    
+    # Pattern 1: ```json ... ```
+    match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    
+    # Pattern 2: Find JSON object/array at start
+    for pattern in [r'^(\{[\s\S]*\})\s*$', r'^(\[[\s\S]*\])\s*$']:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+    
+    # Pattern 3: Find JSON object/array anywhere
+    for pattern in [r'(\{[\s\S]*\})', r'(\[[\s\S]*\])']:
+        matches = list(re.finditer(pattern, text))
+        # Try the largest match first (most likely to be complete)
+        for match in sorted(matches, key=lambda m: len(m.group(1)), reverse=True):
+            try:
+                return json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+    
+    return None
+
+
+def _validate_against_schema(data: Any, schema: dict, path: str = "root") -> list[str]:
+    """Basic schema validation, returns list of error messages."""
+    errors: list[str] = []
+    
+    if not isinstance(schema, dict):
+        return errors
+    
+    schema_type = schema.get("type")
+    
+    if schema_type == "object":
+        if not isinstance(data, dict):
+            errors.append(f"Expected object at {path}, got {type(data).__name__}")
+            return errors
+        
+        # Check required fields
+        required = schema.get("required", [])
+        for field in required:
+            if field not in data:
+                errors.append(f"Missing required field: {path}.{field}")
+        
+        # Validate properties
+        properties = schema.get("properties", {})
+        for key, prop_schema in properties.items():
+            if key in data:
+                sub_errors = _validate_against_schema(data[key], prop_schema, f"{path}.{key}")
+                errors.extend(sub_errors)
+    
+    elif schema_type == "array":
+        if not isinstance(data, list):
+            errors.append(f"Expected array at {path}, got {type(data).__name__}")
+            return errors
+        
+        items_schema = schema.get("items")
+        if items_schema:
+            for i, item in enumerate(data):
+                sub_errors = _validate_against_schema(item, items_schema, f"{path}[{i}]")
+                errors.extend(sub_errors)
+    
+    elif schema_type == "string":
+        if not isinstance(data, str):
+            errors.append(f"Expected string at {path}, got {type(data).__name__}")
+    
+    elif schema_type == "integer":
+        if not isinstance(data, int) or isinstance(data, bool):
+            errors.append(f"Expected integer at {path}, got {type(data).__name__}")
+    
+    elif schema_type == "number":
+        if not isinstance(data, (int, float)) or isinstance(data, bool):
+            errors.append(f"Expected number at {path}, got {type(data).__name__}")
+    
+    elif schema_type == "boolean":
+        if not isinstance(data, bool):
+            errors.append(f"Expected boolean at {path}, got {type(data).__name__}")
+    
+    return errors
 
 
 def _render_template(path: Path, replacements: dict[str, str]) -> str:
@@ -936,6 +1228,8 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
                 "range": {"start": replace_span[0], "end": replace_span[1]},
                 "expected": {"snippet": replace_before},
                 "replacement": replacement,
+                "new_text": "",
+                "comment_text": "",
             },
             {
                 "type": "insert_at",
@@ -943,12 +1237,17 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
                 "range": {"start": insert_pos, "end": insert_pos},
                 "expected": {"snippet": ""},
                 "new_text": " [DRY-RUN]",
+                "replacement": "",
+                "comment_text": "",
             },
             {
-                "type": "delete_range",
+                "type": "replace_range",
                 "target": target,
                 "range": {"start": delete_span[0], "end": delete_span[1]},
                 "expected": {"snippet": delete_match.group(0)},
+                "replacement": "",
+                "new_text": "",
+                "comment_text": "",
             },
             {
                 "type": "add_comment",
@@ -956,6 +1255,8 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
                 "range": {"start": comment_span[0], "end": comment_span[1]},
                 "expected": {"snippet": comment_match.group(0)},
                 "comment_text": "Dry-run QA marker comment.",
+                "replacement": "",
+                "new_text": "",
             },
         ]
 
@@ -1052,30 +1353,6 @@ def _sanitize_chunk_result_ops(
     if first_primary is None:
         raise RuntimeError(f"Chunk {chunk_id} has no valid primary target identities")
 
-    fallback_target = {"part": first_primary[0], "para_id": first_primary[1], "unit_uid": first_primary[2]}
-
-    def conversion_meta(reason: str, *, from_op: dict[str, Any] | None) -> dict[str, Any]:
-        target = fallback_target
-        rng = {"start": 0, "end": 0}
-        snippet = ""
-        if isinstance(from_op, dict):
-            maybe_target = from_op.get("target")
-            maybe_key = _target_key(maybe_target)
-            if maybe_key in primary_targets:
-                target = {"part": maybe_key[0], "para_id": maybe_key[1], "unit_uid": maybe_key[2]}
-            maybe_range = _normalize_range(from_op.get("range"))
-            if maybe_range is not None:
-                rng = maybe_range
-            maybe_expected = from_op.get("expected")
-            if isinstance(maybe_expected, dict):
-                snippet = str(maybe_expected.get("snippet", ""))
-        return {
-            "reason": reason,
-            "target": target,
-            "range": rng,
-            "expected_snippet": snippet,
-        }
-
     # Build lookup map: unit_uid -> (part, para_id, unit_uid) from chunk's primary_units
     # We ALWAYS use this for target resolution since unit_uid is the unique identifier
     # This is deterministic and ignores any AI hallucinations in part/para_id fields
@@ -1093,18 +1370,15 @@ def _sanitize_chunk_result_ops(
         raw_ops = []
 
     sanitized_ops: list[dict[str, Any]] = []
-    converted: list[dict[str, Any]] = []
     kept = 0
 
     for idx, raw_op in enumerate(raw_ops):
         if not isinstance(raw_op, dict):
-            converted.append({"op_index": idx, **conversion_meta("non_object_op", from_op=None)})
-            continue
+            raise RuntimeError(f"Operation at index {idx} is not a dict: {type(raw_op)}")
 
         op_type = str(raw_op.get("type", "")).strip()
         if op_type not in VALID_OP_TYPES:
-            converted.append({"op_index": idx, **conversion_meta("invalid_type", from_op=raw_op)})
-            continue
+            raise RuntimeError(f"Invalid op type '{op_type}' at index {idx}. Valid types: {VALID_OP_TYPES}")
 
         # ALWAYS resolve target using unit_uid from the AI's output
         # but use the chunk's ground truth for part/para_id/unit_uid
@@ -1116,8 +1390,7 @@ def _sanitize_chunk_result_ops(
                 key = unit_uid_to_target[unit_uid]  # Use chunk's ground truth
 
         if key is None:
-            converted.append({"op_index": idx, **conversion_meta("non_primary_target", from_op=raw_op)})
-            continue
+            raise RuntimeError(f"Operation at index {idx} targets non-primary unit: {target}")
 
         normalized_target = {"part": key[0], "para_id": key[1], "unit_uid": key[2]}
         expected = raw_op.get("expected")
@@ -1139,39 +1412,24 @@ def _sanitize_chunk_result_ops(
 
         if op_type == "replace_range":
             if "replacement" not in raw_op:
-                converted.append({"op_index": idx, **conversion_meta("missing_replacement", from_op=raw_op)})
-                continue
+                raise RuntimeError(f"replace_range op missing 'replacement' field at index {idx}")
             replacement = str(raw_op.get("replacement", ""))
-            if replacement == "":
-                # Convert to delete_range - the reviewer intends to delete this text
-                sanitized["type"] = "delete_range"
-                if "replacement" in sanitized:
-                    del sanitized["replacement"]
-                converted.append({"op_index": idx, **conversion_meta("empty_replacement_to_delete_range", from_op=raw_op)})
-                sanitized_ops.append(sanitized)
-                kept += 1
-                continue
+            # Empty replacement is valid - means delete the range
             sanitized["replacement"] = replacement
         elif op_type == "insert_at":
             if normalized_range is not None and normalized_range["start"] != normalized_range["end"]:
-                converted.append({"op_index": idx, **conversion_meta("insert_non_collapsed_range", from_op=raw_op)})
-                continue
+                raise RuntimeError(f"insert_at op at index {idx} has non-collapsed range: {normalized_range}")
             if "new_text" not in raw_op:
-                converted.append({"op_index": idx, **conversion_meta("missing_new_text", from_op=raw_op)})
-                continue
+                raise RuntimeError(f"insert_at op at index {idx} missing 'new_text' field")
             new_text = str(raw_op.get("new_text", ""))
             if new_text == "":
-                converted.append({"op_index": idx, **conversion_meta("empty_new_text", from_op=raw_op)})
-                continue
+                raise RuntimeError(f"insert_at op at index {idx} has empty 'new_text'")
             sanitized["new_text"] = new_text
         elif op_type == "add_comment":
             comment_text = str(raw_op.get("comment_text", "")).strip()
             if not comment_text:
-                converted.append({"op_index": idx, **conversion_meta("missing_comment_text", from_op=raw_op)})
-                continue
+                raise RuntimeError(f"add_comment op missing 'comment_text' at index {idx}")
             sanitized["comment_text"] = comment_text
-        elif op_type == "delete_range":
-            pass
 
         sanitized_ops.append(sanitized)
         kept += 1
@@ -1194,8 +1452,6 @@ def _sanitize_chunk_result_ops(
         "input_op_count": len(raw_ops),
         "output_op_count": len(sanitized_ops),
         "kept_ops": kept,
-        "converted_ops": len(converted),
-        "conversions": converted,
     }
     return sanitized_payload, log_payload
 
@@ -1262,7 +1518,6 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -
             "result_path": str(output_path),
             "input_ops": log_payload["input_op_count"],
             "output_ops": log_payload["output_op_count"],
-            "converted_ops": log_payload["converted_ops"],
         }
 
     worker_count = max(1, int(max_concurrency))
@@ -1280,7 +1535,7 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -
                 "Chunk review done: "
                 f"{summary['chunk_id']} "
                 f"({completed}/{total}) "
-                f"input_ops={summary['input_ops']} output_ops={summary['output_ops']} converted={summary['converted_ops']}"
+                f"input_ops={summary['input_ops']} output_ops={summary['output_ops']}"
             )
 
     summaries.sort(key=lambda item: str(item.get("chunk_id", "")))
@@ -1288,7 +1543,6 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -
         "chunk_count": len(summaries),
         "total_input_ops": sum(int(item.get("input_ops", 0)) for item in summaries),
         "total_output_ops": sum(int(item.get("output_ops", 0)) for item in summaries),
-        "total_converted_ops": sum(int(item.get("converted_ops", 0)) for item in summaries),
         "chunks": summaries,
     }
     _dump_json(paths.chunk_result_sanitization_log, aggregate)
@@ -1296,33 +1550,8 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -
 
 
 def _enforce_no_sanitized_chunk_ops(paths: ProjectPaths, review_summary: dict[str, Any]) -> None:
-    converted_total = int(review_summary.get("total_converted_ops", 0))
-    if converted_total <= 0:
-        return
-
-    chunk_items = review_summary.get("chunks", [])
-    offenders: list[str] = []
-    if isinstance(chunk_items, list):
-        for item in chunk_items:
-            if not isinstance(item, dict):
-                continue
-            converted = int(item.get("converted_ops", 0))
-            if converted <= 0:
-                continue
-            chunk_id = str(item.get("chunk_id", "unknown")).strip() or "unknown"
-            offenders.append(f"{chunk_id} ({converted})")
-
-    offender_preview = ", ".join(offenders[:8]) if offenders else "unknown"
-    if len(offenders) > 8:
-        offender_preview += f", ... (+{len(offenders) - 8} more)"
-
-    raise RuntimeError(
-        "Invalid chunk review ops detected "
-        f"(converted_ops={converted_total}). "
-        "Failing run before merge/apply to avoid silent degradation. "
-        f"Offending chunks: {offender_preview}. "
-        f"See {paths.chunk_result_sanitization_log}"
-    )
+    # No longer needed - validation happens immediately during sanitization
+    pass
 
 
 def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
@@ -1562,8 +1791,7 @@ def run_pipeline(
             "Chunk reviews complete: "
             f"chunks={review_summary['chunk_count']} "
             f"input_ops={review_summary['total_input_ops']} "
-            f"output_ops={review_summary['total_output_ops']} "
-            f"converted={review_summary['total_converted_ops']}"
+            f"output_ops={review_summary['total_output_ops']}"
         )
         _enforce_no_sanitized_chunk_ops(paths, review_summary)
 

@@ -19,7 +19,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["add_comment", "replace_range", "insert_at", "delete_range"]
+            "enum": ["add_comment", "replace_range", "insert_at"]
           },
           "target": {
             "type": "object",

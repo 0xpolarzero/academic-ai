@@ -13,9 +13,9 @@
     <rule>Include range for every op. Use conservative ranges only when confident.</rule>
     <rule>For each op object, always include all three fields: replacement, new_text, comment_text.</rule>
     <rule>For unused fields set empty string "".</rule>
-    <rule>If type=replace_range, replacement must be non-empty and exact intended replacement text.</rule>
+    <rule>If type=replace_range: replacement is the text to insert. Set to empty string "" to delete the range.</rule>
     <rule>If type=insert_at, new_text must be non-empty; range.start must equal range.end.</rule>
     <rule>If type=add_comment, comment_text must be non-empty reviewer comment.</rule>
-    <rule>If you cannot provide a safe replacement/new_text, emit add_comment instead of replace_range/insert_at.</rule>
+    <rule>To delete text: use type=replace_range with replacement="" (empty string).</rule>
   </rules>
 </chunk_review_prompt>

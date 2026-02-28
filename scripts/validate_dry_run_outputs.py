@@ -48,7 +48,7 @@ def _validate_artifact_presence(project_dir: Path) -> dict[str, Path]:
         "linear_units": project_dir / "artifacts/docx_extract/linear_units.json",
         "docx_struct": project_dir / "artifacts/docx_extract/docx_struct.json",
         "manifest": project_dir / "artifacts/chunks/manifest.json",
-        "merged_patch": project_dir / "artifacts/patch/merged_patch.json",
+        "final_patch": project_dir / "artifacts/patch/final_patch.json",
         "merge_report": project_dir / "artifacts/patch/merge_report.json",
         "apply_log": project_dir / "artifacts/apply/apply_log.json",
         "annotated_docx": project_dir / "output/annotated.docx",
@@ -74,10 +74,10 @@ def _validate_json_shapes(paths: dict[str, Path]) -> tuple[dict, dict]:
     if not isinstance(chunks, list) or not chunks:
         raise RuntimeError("Chunk manifest must contain at least one chunk")
 
-    patch = _load_json(paths["merged_patch"])
+    patch = _load_json(paths["final_patch"])
     patch_ops = patch.get("ops")
     if not isinstance(patch_ops, list) or not patch_ops:
-        raise RuntimeError("merged_patch.json must contain at least one op")
+        raise RuntimeError("final_patch.json must contain at least one op")
 
     apply_log = _load_json(paths["apply_log"])
     apply_ops = apply_log.get("ops")
@@ -89,7 +89,7 @@ def _validate_json_shapes(paths: dict[str, Path]) -> tuple[dict, dict]:
         raise RuntimeError("apply_log.json must contain stats object")
 
     if stats.get("input_ops") != len(patch_ops):
-        raise RuntimeError("apply_log stats.input_ops does not match merged_patch op count")
+        raise RuntimeError("apply_log stats.input_ops does not match final_patch op count")
 
     if stats.get("applied_ops", 0) <= 0:
         raise RuntimeError("Expected at least one applied operation in apply_log")
@@ -177,7 +177,7 @@ def main() -> int:
     print("Dry-run acceptance checks passed.")
     print(f"Project: {project_dir}")
     print(f"Annotated DOCX: {paths['annotated_docx']}")
-    print(f"Patch: {paths['merged_patch']}")
+    print(f"Patch: {paths['final_patch']}")
     print(f"Apply log: {paths['apply_log']}")
     return 0
 
