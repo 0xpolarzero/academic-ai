@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 DEFAULT_REVIEW_UNITS_PATH = Path("artifacts/docx_extract/review_units.json")
@@ -16,6 +17,8 @@ DEFAULT_OUTPUT_MD_PATH = Path("output/changes.md")
 DEFAULT_OUTPUT_JSON_PATH = Path("output/changes.json")
 
 CHANGE_REPORT_SCHEMA_VERSION = "change_report.v1"
+UNSAFE_BOLD_CHARS = {"*", "`", "\n", "\r"}
+SPACE_MARKER = "␠"
 
 
 def _now_iso() -> str:
@@ -213,6 +216,14 @@ def _utf16_offsets(text: str) -> list[int]:
         total += len(char.encode("utf-16-le")) // 2
         offsets.append(total)
     return offsets
+
+
+def _utf16_to_cp_bounds(text: str, start_u16: int, end_u16: int) -> tuple[int | None, int | None]:
+    offsets = _utf16_offsets(text)
+    cp_by_u16 = {offset: cp_index for cp_index, offset in enumerate(offsets)}
+    if start_u16 not in cp_by_u16 or end_u16 not in cp_by_u16:
+        return None, None
+    return cp_by_u16[start_u16], cp_by_u16[end_u16]
 
 
 def _find_occurrences(text: str, needle: str) -> list[tuple[int, int]]:
@@ -424,8 +435,38 @@ def _normalize_spaces(text: str) -> str:
     Returns:
         Text with normalized spaces
     """
-    import re
     return re.sub(r'\s+', ' ', text)
+
+
+def _normalize_markdown_suggestion_spacing(text: str) -> str:
+    """
+    Apply conservative spacing normalization for markdown readability.
+
+    Currently removes spaces before commas, including NBSP variants,
+    because these are almost always unintended in replacement suggestions.
+    """
+    # Handle both raw commas and bolded commas ("**,**") in rendered suggestions.
+    normalized = re.sub(r"[ \t\u00A0]+(\*\*,\*\*)", r"\1", text)
+    return re.sub(r"[ \t\u00A0]+,", ",", normalized)
+
+
+def _render_ws_marker(text: str) -> str:
+    if text == " ":
+        return SPACE_MARKER
+    return text.replace(" ", SPACE_MARKER)
+
+
+def _safe_bold(text: str) -> str:
+    if not text:
+        return text
+    if any(char in text for char in UNSAFE_BOLD_CHARS):
+        return (
+            text
+            .replace("\\", "\\\\")
+            .replace("*", "\\*")
+            .replace("`", "\\`")
+        )
+    return f"**{text}**"
 
 
 def _is_word_boundary(text: str, pos: int) -> bool:
@@ -496,10 +537,7 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
     original_old_text = old_text
     original_new_text = new_text
     
-    # Check for whitespace-only changes BEFORE stripping
-    # This handles cases like "word ." -> "word." or "word " -> "word"
-    # Compare by removing ALL whitespace - if equal after removal, only whitespace changed
-    import re
+    # Check for whitespace-only changes BEFORE stripping.
     old_no_ws = re.sub(r'\s+', '', original_old_text)
     new_no_ws = re.sub(r'\s+', '', original_new_text)
     
@@ -516,7 +554,7 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         
         if old_only and not new_only:
             # Whitespace removed from old
-            ws_marker = "** **" if old_only == " " else f"**{old_only}**"
+            ws_marker = _safe_bold(_render_ws_marker(old_only))
             # Find position by counting characters before the first '- ' in diff
             ws_pos = 0
             for d in diff:
@@ -526,10 +564,10 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
             before_ws = original_old_text[:ws_pos]
             after_ws = original_old_text[ws_pos + len(old_only):]
             # At shows original with marker, Suggestion shows new (without the space)
-            return f"{before_ws}{ws_marker}{after_ws}", suggestion_result
+            return f"{before_ws}{ws_marker}{after_ws}", _normalize_markdown_suggestion_spacing(suggestion_result)
         elif new_only and not old_only:
             # Whitespace added to new
-            ws_marker = "** **" if new_only == " " else f"**{new_only}**"
+            ws_marker = _safe_bold(_render_ws_marker(new_only))
             ws_pos = 0
             for d in diff:
                 if d.startswith('+ '):
@@ -538,7 +576,7 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
             before_ws = original_new_text[:ws_pos]
             after_ws = original_new_text[ws_pos + len(new_only):]
             # At shows original, Suggestion shows new with marker
-            return at_result, f"{before_ws}{ws_marker}{after_ws}"
+            return at_result, _normalize_markdown_suggestion_spacing(f"{before_ws}{ws_marker}{after_ws}")
     
     old_text = old_text.strip()
     new_text = new_text.strip()
@@ -548,8 +586,9 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
     new_is_whitespace_only = not new_text or (original_new_text and original_new_text.strip() == "")
     
     if old_is_whitespace_only and new_is_whitespace_only:
-        # Both sides are whitespace-only - skip these as they're not meaningful changes
-        return "", ""
+        old_marker = _safe_bold(_render_ws_marker(original_old_text if original_old_text else " "))
+        new_marker = _safe_bold(_render_ws_marker(original_new_text if original_new_text else " "))
+        return old_marker, new_marker
     
     if not context:
         # No context, just show the minimal diff
@@ -562,15 +601,15 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         old_changed = old_text[old_start:old_end] if old_text else ""
         new_changed = new_text[new_start:new_end] if new_text else ""
         
-        at_result = old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:]
-        suggestion_result = new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:]
+        at_result = old_text[:old_start] + _safe_bold(old_changed) + old_text[old_end:]
+        suggestion_result = new_text[:new_start] + _safe_bold(new_changed) + new_text[new_end:]
         # For pure deletions with no context, show a marker
         if not suggestion_result or suggestion_result == "****":
             suggestion_result = "*(deleted)*"
-        return at_result.strip(), suggestion_result.strip()
+        return at_result.strip(), _normalize_markdown_suggestion_spacing(suggestion_result.strip())
     
     if not old_text:
-        return f"**{old_text}**", f"**{new_text}**" if new_text else ""
+        return _safe_bold(old_text), _safe_bold(new_text) if new_text else ""
     
     # Find old_text at a word boundary to avoid partial word matches
     # (e.g., finding "ce" inside "ces", "les" inside "agricoles")
@@ -580,10 +619,10 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         # For deletions (empty new_text), show the old text bolded in At column,
         # and the suggestion shows context with the text removed (no marker needed)
         if new_text:
-            return f"**{old_text}**", f"**{new_text}**"
+            return _safe_bold(old_text), _safe_bold(new_text)
         else:
             # Deletion: show bolded old text, suggestion is just empty
-            return f"**{old_text}**", ""
+            return _safe_bold(old_text), ""
     
     # Split context into before, target, after
     before = context[:idx]
@@ -613,19 +652,19 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         # Don't use _strip_boundary_spaces as it would remove the very whitespace we're highlighting
         if old_changed and not new_changed:
             # Whitespace was removed (e.g., "word ." -> "word.")
-            at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
+            at_formatted = before + old_text[:old_start] + _safe_bold(_render_ws_marker(old_changed)) + old_text[old_end:] + after
             suggestion_formatted = before + old_text[:old_start] + old_text[old_end:] + after
         elif not old_changed and new_changed:
             # Whitespace was added (e.g., "50.Les" -> "50. Les")
             # Build suggestion showing the space within the context
             # new_text[:new_start] + new_changed + new_text[new_end:] = complete new_text
             at_formatted = before + old_text + after
-            suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
+            suggestion_formatted = before + new_text[:new_start] + _safe_bold(_render_ws_marker(new_changed)) + new_text[new_end:] + after
         else:
             # Whitespace was replaced (unlikely but handle it)
-            at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
-            suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
-        return at_formatted.strip(), suggestion_formatted.strip()
+            at_formatted = before + old_text[:old_start] + _safe_bold(_render_ws_marker(old_changed)) + old_text[old_end:] + after
+            suggestion_formatted = before + new_text[:new_start] + _safe_bold(_render_ws_marker(new_changed)) + new_text[new_end:] + after
+        return at_formatted.strip(), _normalize_markdown_suggestion_spacing(suggestion_formatted.strip())
     
     if old_is_empty and not new_is_empty:
         # The "changed" portion of old is empty, meaning the diff is entirely 
@@ -638,33 +677,33 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
             if prefix_len == 0:
                 # PREFIX insertion: new_changed comes BEFORE old_text
                 new_changed_stripped = new_changed.rstrip()
-                at_formatted = before + f"**{old_text}**" + after
-                suggestion_formatted = before + f"**{new_changed_stripped}** " + old_text + after
+                at_formatted = before + _safe_bold(old_text) + after
+                suggestion_formatted = before + _safe_bold(new_changed_stripped) + " " + old_text + after
             elif prefix_len >= len(old_text):
                 # SUFFIX addition: new_changed comes AFTER old_text
                 # e.g., "potentielle" -> "potentielles": new_changed="s"
-                at_formatted = before + f"**{old_text}**" + after
+                at_formatted = before + _safe_bold(old_text) + after
                 # For suffix addition, bold the entire new_text for clarity
                 # This avoids awkward output like "word**s**" instead of "**words**"
-                suggestion_formatted = before + f"**{new_text}**" + after
+                suggestion_formatted = before + _safe_bold(new_text) + after
             else:
                 # MID insertion: old_text is split by the change
                 # e.g., "engrangeant" -> "engrangeaient": "engrangea" + "ie" + "nt"
                 # The suffix "nt" was matched but should be AFTER the new content
                 # Show full new_text bolded for clarity
-                at_formatted = before + f"**{old_text}**" + after
-                suggestion_formatted = before + f"**{new_text}**" + after
+                at_formatted = before + _safe_bold(old_text) + after
+                suggestion_formatted = before + _safe_bold(new_text) + after
             suggestion_formatted = _normalize_spaces(suggestion_formatted)
         else:
             # True insertion (old_text was empty)
             at_formatted = before + after
-            suggestion_formatted = before + f"**{new_text}**" + after
+            suggestion_formatted = before + _safe_bold(new_text) + after
     elif new_is_empty and not old_is_empty:
         # Pure deletion within the text
         # Strip boundary spaces to prevent '** de**' or '**être **'
         old_start, old_end = _strip_boundary_spaces(old_text, old_start, old_end)
         old_changed = old_text[old_start:old_end]
-        at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
+        at_formatted = before + old_text[:old_start] + _safe_bold(old_changed) + old_text[old_end:] + after
         # Remove the deleted portion for suggestion
         # Fix double spaces: if before ends with space and after starts with space, normalize
         suggestion_formatted = before + old_text[:old_start] + old_text[old_end:] + after
@@ -687,7 +726,7 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         new_changed = new_text[new_start:new_end]
         
         # Build the At column
-        at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
+        at_formatted = before + old_text[:old_start] + _safe_bold(old_changed) + old_text[old_end:] + after
         
         # Build the Suggestion column
         # Check for overlap: if new_text ends with text that matches start of 'after'
@@ -706,11 +745,11 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
                     suggestion_after = suggestion_after[:len(suggestion_after) - len(after_stripped)] + after_stripped[overlap_len:]
                     break
         
-        suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text_remainder + suggestion_after
+        suggestion_formatted = before + new_text[:new_start] + _safe_bold(new_changed) + new_text_remainder + suggestion_after
         # Normalize spaces
         suggestion_formatted = _normalize_spaces(suggestion_formatted)
-    
-    return at_formatted.strip(), suggestion_formatted.strip()
+
+    return at_formatted.strip(), _normalize_markdown_suggestion_spacing(suggestion_formatted.strip())
 
 
 def format_deletion(context: str, deleted_text: str) -> tuple[str, str]:
@@ -726,22 +765,22 @@ def format_deletion(context: str, deleted_text: str) -> tuple[str, str]:
     original_deleted_text = deleted_text
     deleted_text = deleted_text.strip()
     
-    # Handle whitespace-only deletions (e.g., space removal) - skip as not meaningful
+    # Keep whitespace-only deletions visible so markdown mirrors annotated DOCX.
     if not deleted_text and original_deleted_text and original_deleted_text.strip() == "":
-        return "", ""
-    
+        return _safe_bold(_render_ws_marker(original_deleted_text)), "*(deleted)*"
+
     if not context or not deleted_text:
-        return f"**{deleted_text}**" if deleted_text else "", "*(deleted)*" if deleted_text else ""
-    
+        return _safe_bold(deleted_text) if deleted_text else "", "*(deleted)*" if deleted_text else ""
+
     if deleted_text in context:
-        at_formatted = context.replace(deleted_text, f"**{deleted_text}**", 1)
+        at_formatted = context.replace(deleted_text, _safe_bold(deleted_text), 1)
         # For suggestion, just remove the deleted text (no marker needed)
         suggestion_formatted = context.replace(deleted_text, "", 1).strip()
     else:
-        at_formatted = f"**{deleted_text}**"
+        at_formatted = _safe_bold(deleted_text)
         suggestion_formatted = "*(deleted)*"
-    
-    return at_formatted.strip(), suggestion_formatted
+
+    return at_formatted.strip(), _normalize_markdown_suggestion_spacing(suggestion_formatted)
 
 
 def format_comment(context: str, target: str, comment_text: str) -> tuple[str, str]:
@@ -769,10 +808,10 @@ def format_comment(context: str, target: str, comment_text: str) -> tuple[str, s
         return "", ""
     
     if not context:
-        return f"**{target}**" if target else "", comment_text
-    
+        return _safe_bold(target) if target else "", comment_text
+
     if target and target in context:
-        at_formatted = context.replace(target, f"**{target}**", 1)
+        at_formatted = context.replace(target, _safe_bold(target), 1)
     else:
         at_formatted = context
     
@@ -833,6 +872,146 @@ def _escape_table_cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
+def _location_key(change: dict[str, Any]) -> tuple[str, str, str]:
+    location = change.get("location", {})
+    if not isinstance(location, dict):
+        return ("", "", "")
+    return (
+        str(location.get("part", "")),
+        str(location.get("para_id", "")),
+        str(location.get("unit_uid", "")),
+    )
+
+
+def _mergeable_gap_text(unit_text: str, left_end_cp: int, right_start_cp: int) -> str:
+    if left_end_cp < 0 or right_start_cp < 0 or right_start_cp < left_end_cp:
+        return ""
+    return unit_text[left_end_cp:right_start_cp]
+
+
+def _can_merge_replace_pair(left: dict[str, Any], right: dict[str, Any], max_gap_u16: int = 32) -> bool:
+    if left.get("type") != "replace_range" or right.get("type") != "replace_range":
+        return False
+    if _location_key(left) != _location_key(right):
+        return False
+
+    left_range = left.get("range", {})
+    right_range = right.get("range", {})
+    if not isinstance(left_range, dict) or not isinstance(right_range, dict):
+        return False
+
+    left_end_u16 = _to_int(left_range.get("end"), -1)
+    right_start_u16 = _to_int(right_range.get("start"), -1)
+    gap_u16 = right_start_u16 - left_end_u16
+    if gap_u16 < 0 or gap_u16 > max_gap_u16:
+        return False
+
+    left_end_cp = _to_int(left.get("_range_cp_end"), -1)
+    right_start_cp = _to_int(right.get("_range_cp_start"), -1)
+    unit_text = str(left.get("_unit_text", ""))
+    if not unit_text or left_end_cp < 0 or right_start_cp < 0:
+        return False
+
+    # Do not merge across sentence boundaries.
+    between = _mergeable_gap_text(unit_text, left_end_cp, right_start_cp)
+    if any(punct in between for punct in (".", "!", "?", "\n")):
+        return False
+
+    return True
+
+
+def _merge_replace_group(group: list[dict[str, Any]]) -> dict[str, Any]:
+    first = group[0]
+    last = group[-1]
+    unit_text = str(first.get("_unit_text", ""))
+    start_cp = _to_int(first.get("_range_cp_start"), 0)
+    end_cp = _to_int(last.get("_range_cp_end"), start_cp)
+
+    base_old_text = unit_text[start_cp:end_cp] if unit_text else str(first.get("exact_snippet", ""))
+    merged_new_text = base_old_text
+
+    # Apply replacements right-to-left so earlier relative offsets remain stable.
+    for item in reversed(group):
+        item_start_cp = _to_int(item.get("_range_cp_start"), start_cp)
+        item_end_cp = _to_int(item.get("_range_cp_end"), item_start_cp)
+        rel_start = max(0, item_start_cp - start_cp)
+        rel_end = max(rel_start, item_end_cp - start_cp)
+        replacement = str(item.get("after_snippet", ""))
+        merged_new_text = merged_new_text[:rel_start] + replacement + merged_new_text[rel_end:]
+
+    merged = dict(first)
+    merged["range"] = {
+        "start": _to_int(first.get("range", {}).get("start"), 0),
+        "end": _to_int(last.get("range", {}).get("end"), _to_int(first.get("range", {}).get("start"), 0)),
+    }
+    merged["before_snippet"] = base_old_text
+    merged["exact_snippet"] = base_old_text
+    merged["after_snippet"] = merged_new_text
+    merged["location_uncertain"] = any(bool(item.get("location_uncertain")) for item in group)
+    merged["op_index"] = min(int(item.get("op_index", 10**9)) for item in group)
+    merged["merged_op_indices"] = sorted({int(item.get("op_index", -1)) for item in group if int(item.get("op_index", -1)) >= 0})
+
+    # Disambiguation on individual ops is no longer meaningful after merge.
+    merged.pop("disambiguation", None)
+    return merged
+
+
+def _merge_adjacent_replace_changes(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not changes:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    cursor = 0
+    total = len(changes)
+
+    while cursor < total:
+        current = changes[cursor]
+        if current.get("type") != "replace_range":
+            merged.append(current)
+            cursor += 1
+            continue
+
+        group = [current]
+        look_ahead = cursor + 1
+        while look_ahead < total:
+            candidate = changes[look_ahead]
+            if group[-1].get("type") != "replace_range" or candidate.get("type") != "replace_range":
+                break
+
+            # Compare in textual order, not op_index order. Some pipelines emit
+            # replacement ops in reverse sentence order.
+            left, right = sorted(
+                [group[-1], candidate],
+                key=lambda item: _to_int(item.get("_range_cp_start"), _to_int(item.get("range", {}).get("start"), 10**9)),
+            )
+            if not _can_merge_replace_pair(left, right):
+                break
+            group.append(candidate)
+            look_ahead += 1
+
+        if len(group) == 1:
+            merged.append(current)
+            cursor += 1
+            continue
+
+        ordered_group = sorted(
+            group,
+            key=lambda item: _to_int(item.get("_range_cp_start"), _to_int(item.get("range", {}).get("start"), 10**9)),
+        )
+        merged.append(_merge_replace_group(ordered_group))
+        cursor = look_ahead
+
+    return merged
+
+
+def _strip_internal_change_fields(changes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for change in changes:
+        cleaned = {key: value for key, value in change.items() if not key.startswith("_")}
+        sanitized.append(cleaned)
+    return sanitized
+
+
 def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start_index: int = 1) -> int:
     """Render a table of changes.
     
@@ -866,7 +1045,7 @@ def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start
             at_snippet, suggestion = format_deletion(before, exact_snippet)
         elif op_type == "insert_at":
             at_snippet = before
-            suggestion = f"**{after}**" if after else ""
+            suggestion = _safe_bold(after) if after else ""
         elif op_type == "add_comment":
             at_snippet, suggestion = format_comment(before, exact_snippet, str(annotation) if annotation else "")
         else:
@@ -877,6 +1056,9 @@ def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start
         # whitespace-only changes, or empty comments)
         if not at_snippet.strip() and not suggestion.strip():
             continue
+
+        if _is_edit_op(op_type):
+            suggestion = _normalize_markdown_suggestion_spacing(suggestion)
         
         # Note: uncertainty flag is tracked in metadata but not displayed in markdown
         # to keep the output clean and professional
@@ -995,6 +1177,8 @@ def build_change_report_payload(
 
         op_target = _normalize_target(op.get("target"))
         apply_entry = apply_by_index.get(op_index, {})
+        if str(apply_entry.get("status", "")).strip() and str(apply_entry.get("status", "")).strip() != "applied":
+            continue
         resolved_target = _normalize_target(apply_entry.get("resolved_target"))
         unit = _resolve_unit(
             op_target=op_target,
@@ -1020,20 +1204,10 @@ def build_change_report_payload(
 
         before = _before_snippet(op, apply_entry)
         after = _after_snippet(op, op_type)
-        
-        # Skip no-op operations (where old_text == new_text)
-        # These are typically data quality issues in the upstream patch
-        # Apply to all edit operations: replace_range, insert_at, delete_range
-        if op_type in ("replace_range", "insert_at", "delete_range"):
-            # For insert_at, 'before' is typically empty and 'after' has the new text
-            # For delete_range, 'after' is empty and 'before' has the deleted text
-            # For replace_range, both have content
-            # Skip if they appear identical (ignoring all whitespace variations)
-            import re
-            before_no_ws = re.sub(r'\s+', '', before)
-            after_no_ws = re.sub(r'\s+', '', after)
-            if before_no_ws == after_no_ws:
-                continue
+
+        # Skip true no-op edits only (exact match), but keep whitespace-only edits.
+        if op_type in ("replace_range", "insert_at", "delete_range") and before == after:
+            continue
         
         # Skip comments with internal processing artifacts (conflict downgrades)
         # These are not meaningful user-facing suggestions
@@ -1047,6 +1221,11 @@ def build_change_report_payload(
                 continue
         
         accepted_text = str(unit.get("accepted_text", "")) if unit else ""
+        range_start_cp, range_end_cp = _utf16_to_cp_bounds(
+            accepted_text,
+            range_start_u16,
+            range_end_u16,
+        ) if accepted_text else (None, None)
         disambiguation = _disambiguation(
             before_snippet=before,
             accepted_text=accepted_text,
@@ -1096,6 +1275,9 @@ def build_change_report_payload(
             "after_snippet": after,
             "annotation": annotation,
             "location_uncertain": disambiguation is not None and disambiguation.get("occurrence_count", 1) > 1,
+            "_unit_text": accepted_text,
+            "_range_cp_start": range_start_cp if range_start_cp is not None else -1,
+            "_range_cp_end": range_end_cp if range_end_cp is not None else -1,
         }
 
         if disambiguation is not None:
@@ -1103,9 +1285,12 @@ def build_change_report_payload(
 
         changes.append(change)
 
-    stats = {
-        "op_count": len(changes),
-    }
+    changes.sort(key=lambda item: int(item.get("op_index", 10**9)))
+    changes = _merge_adjacent_replace_changes(changes)
+    changes.sort(key=lambda item: int(item.get("op_index", 10**9)))
+    changes = _strip_internal_change_fields(changes)
+
+    stats = {"op_count": len(changes)}
 
     return {
         "schema_version": CHANGE_REPORT_SCHEMA_VERSION,

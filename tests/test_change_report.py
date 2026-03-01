@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any
@@ -212,8 +213,8 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
     )
 
     assert payload["schema_version"] == "change_report.v1"
-    assert payload["stats"]["op_count"] == 2
-    # Stats now only include op_count (removed applied/skipped/unknown)
+    assert payload["stats"]["op_count"] == 1
+    # Stats count only applied operations present in annotated DOCX.
 
     first_change = payload["changes"][0]
     assert first_change["location"]["heading_path"] == ["Section 1"]
@@ -229,22 +230,14 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
     # location_uncertain is False since there's no disambiguation
     assert first_change.get("location_uncertain") is False
 
-    second_change = payload["changes"][1]
-    assert "Alpha" in second_change["before_snippet"]
-    assert second_change["after_snippet"] == "Clarify intro."
-    assert second_change["annotation"] == "Clarify intro."
-    assert second_change.get("location_uncertain") is False
-
     # Markdown now uses Review format with tables
     assert "# Review" in markdown
-    assert "2 suggestions" in markdown
+    assert "1 suggestions" in markdown
     assert "Section 1" in markdown
     assert "| # | At | Suggestion |" in markdown
     # Context in both columns, old text bold in At, new text bold in Suggestion
     assert "**beta**" in markdown  # Old text bold
     assert "**BETA**" in markdown  # New text bold
-    # Comment text in table
-    assert "Clarify intro." in markdown
 
 
 def test_change_report_includes_disambiguation_for_repeated_before_snippet(tmp_path: Path) -> None:
@@ -360,3 +353,168 @@ def test_change_report_includes_disambiguation_for_repeated_before_snippet(tmp_p
         "end": second_beta_end,
     }
     assert len(disambiguation["match_start_offsets"]) == 2
+
+
+def test_change_report_keeps_whitespace_changes_merges_adjacent_replacements_and_avoids_unsafe_bold(tmp_path: Path) -> None:
+    accepted_text = " Dans ceci ; mais internaliste et externaliste. A*B pattern. géopolitique "
+
+    dans_start, dans_end = _utf16_span_for_occurrence(accepted_text, " Dans")
+    semicolon_start, semicolon_end = _utf16_span_for_occurrence(accepted_text, "; mais")
+    internaliste_start, internaliste_end = _utf16_span_for_occurrence(accepted_text, "internaliste")
+    externaliste_start, externaliste_end = _utf16_span_for_occurrence(accepted_text, "externaliste")
+    star_start, star_end = _utf16_span_for_occurrence(accepted_text, "A*B")
+    geo_start, geo_end = _utf16_span_for_occurrence(accepted_text, "géopolitique ")
+
+    review_units_path = tmp_path / "artifacts/docx_extract/review_units.json"
+    patch_path = tmp_path / "artifacts/patch/merged_patch.json"
+    apply_log_path = tmp_path / "artifacts/apply/apply_log.json"
+    output_md = tmp_path / "output/changes.md"
+    output_json = tmp_path / "output/changes.json"
+
+    _write_json(
+        review_units_path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 1,
+            "unit_count": 1,
+            "units": [
+                {
+                    "part": "word/document.xml",
+                    "part_kind": "body",
+                    "part_name": "document",
+                    "para_id": "para_1",
+                    "unit_uid": "unit_1",
+                    "accepted_text": accepted_text,
+                    "heading_path": ["Section 1"],
+                    "order_index": 0,
+                    "location": {
+                        "global_order_index": 0,
+                        "paragraph_index_in_part": 0,
+                        "part_index": 0,
+                        "in_table": False,
+                        "path_hint": "word/document.xml::.//w:p[1]",
+                    },
+                }
+            ],
+        },
+    )
+
+    ops = [
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": dans_start, "end": dans_end},
+            "expected": {"snippet": " Dans"},
+            "replacement": "Dans",
+        },
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": semicolon_start, "end": semicolon_end},
+            "expected": {"snippet": "; mais"},
+            "replacement": ", mais",
+        },
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": externaliste_start, "end": externaliste_end},
+            "expected": {"snippet": "externaliste"},
+            "replacement": "externalistes",
+        },
+        # Intentionally keep reverse textual order (externaliste before internaliste)
+        # to validate order-agnostic merge behavior.
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": internaliste_start, "end": internaliste_end},
+            "expected": {"snippet": "internaliste"},
+            "replacement": "internalistes",
+        },
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": star_start, "end": star_end},
+            "expected": {"snippet": "A*B"},
+            "replacement": "A*B*",
+        },
+        {
+            "type": "replace_range",
+            "target": {"part": "word/document.xml", "para_id": "para_1", "unit_uid": "unit_1"},
+            "range": {"start": geo_start, "end": geo_end},
+            "expected": {"snippet": "géopolitique "},
+            "replacement": "géopolitique",
+        },
+    ]
+    _write_json(
+        patch_path,
+        {
+            "schema_version": "patch.v1",
+            "created_at": "2026-03-01T00:00:00Z",
+            "author": "test",
+            "ops": ops,
+        },
+    )
+
+    apply_ops = []
+    for op_index, op in enumerate(ops):
+        apply_ops.append(
+            {
+                "op_index": op_index,
+                "type": op["type"],
+                "target": op["target"],
+                "resolved_target": {
+                    "part": op["target"]["part"],
+                    "para_id": op["target"]["para_id"],
+                    "unit_uid": op["target"]["unit_uid"],
+                    "paragraph_index_in_part": 0,
+                },
+                "range": op["range"],
+                "expected": op["expected"],
+                "actual_snippet": op["expected"]["snippet"],
+                "status": "applied",
+                "reason": None,
+            }
+        )
+
+    _write_json(
+        apply_log_path,
+        {
+            "schema_version": "apply_log.v1",
+            "created_at": "2026-03-01T00:00:01Z",
+            "ops": apply_ops,
+        },
+    )
+
+    payload, markdown = _run_report(
+        review_units_path=review_units_path,
+        patch_path=patch_path,
+        apply_log_path=apply_log_path,
+        output_md=output_md,
+        output_json=output_json,
+    )
+
+    # Whitespace-only edits should be visible in the markdown report.
+    assert "␠" in markdown
+
+    # Spacing before comma should be normalized in suggestion output.
+    assert " , mais" not in markdown
+    assert ", mais" in markdown
+    assert re.search(r"[ \u00A0]\*\*,\*\*", markdown) is None
+
+    # Adjacent sentence-level replacements should be merged into one suggestion.
+    merged = [
+        change for change in payload["changes"]
+        if change.get("type") == "replace_range"
+        and "internaliste" in str(change.get("exact_snippet", ""))
+        and "externaliste" in str(change.get("exact_snippet", ""))
+        and "internalistes" in str(change.get("after_snippet", ""))
+        and "externalistes" in str(change.get("after_snippet", ""))
+    ]
+    assert len(merged) == 1
+    merged_indices = set(merged[0].get("merged_op_indices", []))
+    assert 2 in merged_indices
+    assert 3 in merged_indices
+
+    # Unsafe markdown-bold text should remain unwrapped.
+    assert "**A*B**" not in markdown
+    assert "A\\*B" in markdown
