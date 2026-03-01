@@ -42,30 +42,71 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _discover_input_names(project_dir: Path) -> list[str]:
+    """Discover input names from artifact subdirectories.
+    
+    Returns a list of input names (e.g., ['source', 'chapter1']) found in
+    the artifacts/docx_extract/ directory.
+    """
+    extract_dir = project_dir / "artifacts" / "docx_extract"
+    if not extract_dir.exists():
+        return []
+    
+    input_names = []
+    for item in extract_dir.iterdir():
+        if item.is_dir() and (item / "review_units.json").exists():
+            input_names.append(item.name)
+    
+    return sorted(input_names)
+
+
 def _validate_artifact_presence(project_dir: Path) -> dict[str, Path]:
-    required = {
-        "review_units": project_dir / "artifacts/docx_extract/review_units.json",
-        "linear_units": project_dir / "artifacts/docx_extract/linear_units.json",
-        "docx_struct": project_dir / "artifacts/docx_extract/docx_struct.json",
-        "manifest": project_dir / "artifacts/chunks/manifest.json",
-        "final_patch": project_dir / "artifacts/patch/final_patch.json",
-        "merge_report": project_dir / "artifacts/patch/merge_report.json",
-        "apply_log": project_dir / "artifacts/apply/apply_log.json",
-        "annotated_docx": project_dir / "output/annotated.docx",
-        "changes_md": project_dir / "output/changes.md",
-        "changes_json": project_dir / "output/changes.json",
-    }
+    # Discover available input names from artifact structure
+    input_names = _discover_input_names(project_dir)
+    
+    if not input_names:
+        # Fall back to legacy structure for backward compatibility
+        input_name = None
+        base_paths = {
+            "review_units": project_dir / "artifacts/docx_extract/review_units.json",
+            "linear_units": project_dir / "artifacts/docx_extract/linear_units.json",
+            "docx_struct": project_dir / "artifacts/docx_extract/docx_struct.json",
+            "manifest": project_dir / "artifacts/chunks/manifest.json",
+            "final_patch": project_dir / "artifacts/patch/final_patch.json",
+            "merge_report": project_dir / "artifacts/patch/merge_report.json",
+            "apply_log": project_dir / "artifacts/apply/apply_log.json",
+            "annotated_docx": project_dir / "output/annotated.docx",
+            "changes_md": project_dir / "output/changes.md",
+            "changes_json": project_dir / "output/changes.json",
+        }
+        chunk_results_dir = project_dir / "artifacts/chunk_results"
+    else:
+        # Use the first discovered input name (for validation, any is fine)
+        input_name = input_names[0]
+        base_paths = {
+            "review_units": project_dir / "artifacts/docx_extract" / input_name / "review_units.json",
+            "linear_units": project_dir / "artifacts/docx_extract" / input_name / "linear_units.json",
+            "docx_struct": project_dir / "artifacts/docx_extract" / input_name / "docx_struct.json",
+            "manifest": project_dir / "artifacts/chunks" / input_name / "manifest.json",
+            "final_patch": project_dir / "artifacts/patch" / input_name / "final_patch.json",
+            "merge_report": project_dir / "artifacts/patch" / input_name / "merge_report.json",
+            "apply_log": project_dir / "artifacts/apply" / input_name / "apply_log.json",
+            "annotated_docx": project_dir / "output" / f"{input_name}_annotated.docx",
+            "changes_md": project_dir / "output" / f"{input_name}_changes.md",
+            "changes_json": project_dir / "output" / f"{input_name}_changes.json",
+        }
+        chunk_results_dir = project_dir / "artifacts/chunk_results" / input_name
+    
+    _require_dir(chunk_results_dir)
 
-    _require_dir(project_dir / "artifacts/chunk_results")
-
-    for path in required.values():
+    for path in base_paths.values():
         _require_file(path)
 
-    chunk_results = sorted((project_dir / "artifacts/chunk_results").glob("chunk_*_result.json"))
+    chunk_results = sorted(chunk_results_dir.glob("chunk_*_result.json"))
     if not chunk_results:
         raise RuntimeError("Expected at least one synthetic chunk result artifact")
 
-    return required
+    return base_paths
 
 
 def _validate_json_shapes(paths: dict[str, Path]) -> tuple[dict, dict]:

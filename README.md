@@ -10,19 +10,30 @@ All pipeline skills are being standardized to a single required CLI flag:
 
 Path resolution contract:
 
-- `input/source.docx` is resolved under `--project-dir`
-- all intermediate files are resolved under `<project-dir>/artifacts/...`
-- final files are resolved under `<project-dir>/output/...`
-- workflow files are resolved under `<project-dir>/workflows/...`
+- Input DOCX files are resolved under `--project-dir/input/`
+- All intermediate files are resolved under `<project-dir>/artifacts/<input_name>/...`
+- Final files are resolved under `<project-dir>/output/...`
+- Workflow files are resolved under `<project-dir>/workflows/...`
 
 Planned default structure:
 
 ```text
 projects/<project_slug>/
-  input/source.docx
+  input/
+    file1.docx
+    file2.docx
+    ...
   workflows/<workflow_name>.xml
   artifacts/
+    docx_extract/<input_name>/
+    chunks/<input_name>/
+    chunk_results/<input_name>/
+    patch/<input_name>/
+    apply/<input_name>/
   output/
+    <input_name>_annotated.docx
+    <input_name>_changes.md
+    <input_name>_changes.json
 ```
 
 Agent contracts (used by `scripts/run_project.py`):
@@ -77,24 +88,41 @@ python -m pip install --upgrade pip pytest
 make project PROJECT=thesis
 ```
 
-2. Put your source DOCX at:
+2. Put your source DOCX file(s) in:
 
 ```text
-projects/thesis/input/source.docx
+projects/thesis/input/
 ```
 
-3. Run one command:
+You can add multiple `.docx` files. Each file will be processed independently with outputs named after the input file.
+
+3. Run the workflow:
 
 ```bash
+# If only one file in input/, it will be auto-selected
 make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative
+
+# If multiple files exist, specify which one to process
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
+
+# Process files one by one (outputs are never overwritten)
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter2.docx
 ```
 
-4. Read final outputs:
+4. Read final outputs (named after the input file):
 
 ```text
-projects/thesis/output/annotated.docx
-projects/thesis/output/changes.md
-projects/thesis/output/changes.json
+projects/thesis/output/<input_name>_annotated.docx
+projects/thesis/output/<input_name>_changes.md
+projects/thesis/output/<input_name>_changes.json
+```
+
+For example, if you processed `chapter1.docx`:
+```text
+projects/thesis/output/chapter1_annotated.docx
+projects/thesis/output/chapter1_changes.md
+projects/thesis/output/chapter1_changes.json
 ```
 
 5. Offline CI/e2e smoke (no Codex calls):
@@ -115,6 +143,15 @@ make test
 .venv/bin/python scripts/run_project.py \
   --project thesis \
   --workflow fr_copyedit_conservative
+```
+
+Specify an input file with `--input`:
+
+```bash
+.venv/bin/python scripts/run_project.py \
+  --project thesis \
+  --workflow fr_copyedit_conservative \
+  --input chapter1.docx
 ```
 
 Use `--dry-run` to avoid CLI calls and generate synthetic chunk review outputs:

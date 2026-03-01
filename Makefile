@@ -25,7 +25,7 @@ help:
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
 	@echo "  make report    # patch/apply -> output/changes.{md,json}"
 	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
-	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [DRY_RUN=1] [CLI=codex|kimi]  # run project workflow"
+	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>] [DRY_RUN=1] [CLI=codex|kimi|claude] [MODEL=<model>]  # run project workflow"
 	@echo "  make test      # pytest unit + integration checks"
 	@echo "  make e2e       # offline thesis dry-run + acceptance checks"
 
@@ -42,21 +42,19 @@ project:
 	@echo "Scaffolded projects/$(PROJECT)"
 
 run:
-	@test -n "$(PROJECT)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name>" && exit 2)
-	@test -n "$(WORKFLOW)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name>" && exit 2)
+	@test -n "$(PROJECT)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>]" && exit 2)
+	@test -n "$(WORKFLOW)" || (echo "Usage: make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>]" && exit 2)
 	@test -d "projects/$(PROJECT)" || (echo "Missing project directory: projects/$(PROJECT)" && exit 2)
 	@test -f "projects/$(PROJECT)/workflows/$(WORKFLOW).xml" || (echo "Missing workflow file: projects/$(PROJECT)/workflows/$(WORKFLOW).xml" && exit 2)
 	@test -f "scripts/run_project.py" || (echo "Missing runner: scripts/run_project.py" && exit 2)
 	@mkdir -p "projects/$(PROJECT)/input"
-	@if [ ! -f "projects/$(PROJECT)/input/source.docx" ]; then \
-		if [ -f "$(FIXTURE_DOCX)" ]; then \
-			cp "$(FIXTURE_DOCX)" "projects/$(PROJECT)/input/source.docx"; \
-			echo "Seeded projects/$(PROJECT)/input/source.docx from fixture"; \
-		else \
-			echo "Missing projects/$(PROJECT)/input/source.docx and fixture $(FIXTURE_DOCX)"; \
-			echo "Run: make fixtures"; \
-			exit 2; \
-		fi; \
+	@DOCX_COUNT=$$(find "projects/$(PROJECT)/input" -maxdepth 1 -name "*.docx" | wc -l); \
+	if [ "$(INPUT)" = "" ] && [ "$$DOCX_COUNT" -eq 0 ] && [ -f "$(FIXTURE_DOCX)" ]; then \
+		cp "$(FIXTURE_DOCX)" "projects/$(PROJECT)/input/source.docx"; \
+		echo "Seeded projects/$(PROJECT)/input/source.docx from fixture"; \
+	elif [ "$(INPUT)" != "" ] && [ ! -f "projects/$(PROJECT)/input/$(INPUT)" ]; then \
+		echo "Error: Specified input file not found: projects/$(PROJECT)/input/$(INPUT)"; \
+		exit 2; \
 	fi
 	@DRY_FLAG=""; \
 	if [ -n "$(DRY_RUN)" ] && [ "$(DRY_RUN)" != "0" ] && [ "$(DRY_RUN)" != "false" ] && [ "$(DRY_RUN)" != "no" ]; then \
@@ -66,7 +64,15 @@ run:
 	if [ -n "$(CLI)" ]; then \
 		CLI_FLAG="--cli $(CLI)"; \
 	fi; \
-	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$DRY_FLAG $$CLI_FLAG
+	MODEL_FLAG=""; \
+	if [ -n "$(MODEL)" ]; then \
+		MODEL_FLAG="--model $(MODEL)"; \
+	fi; \
+	INPUT_FLAG=""; \
+	if [ -n "$(INPUT)" ]; then \
+		INPUT_FLAG="--input $(INPUT)"; \
+	fi; \
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$INPUT_FLAG $$DRY_FLAG $$CLI_FLAG $$MODEL_FLAG
 
 fixtures:
 	@mkdir -p fixtures

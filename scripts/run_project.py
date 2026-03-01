@@ -75,6 +75,7 @@ class ProjectPaths:
     project_dir: Path
     workflow_xml: Path
     source_docx: Path
+    input_name: str  # Base name of input file without extension
     constants: Path
     extract_output_dir: Path
     chunks_output_dir: Path
@@ -125,12 +126,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", required=True, help="Project slug under projects/")
     parser.add_argument("--workflow", required=True, help="Workflow name in projects/<project>/workflows/<name>.xml")
+    parser.add_argument("--input", default=None, help="Input DOCX filename (e.g., 'chapter1.docx'). If omitted and only one file exists in input/, uses that file. If omitted and multiple files exist, errors.")
     parser.add_argument("--constants", type=Path, default=Path("config/constants.json"), help="Path to constants JSON")
     parser.add_argument("--author", default="phase4-runner", help="Author value used in merge/apply artifacts")
     parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk reviewers")
     parser.add_argument("--dry-run", action="store_true", help="Generate synthetic chunk results instead of model outputs")
     parser.add_argument("--skip-validation", action="store_true", help="Skip QA acceptance checks at the end")
     parser.add_argument("--cli", default="codex", choices=("codex", "claude", "kimi"), help="CLI provider to use for AI calls: codex, claude (Claude Code), or kimi (default: codex)")
+    parser.add_argument("--model", default=None, help="Model to use for AI calls (e.g., 'gpt-5.3-codex', 'kimi-k2', 'sonnet')")
     return parser
 
 
@@ -419,7 +422,7 @@ def _normalize_kimi_ops(result: dict[str, Any], chunk_payload: dict[str, Any]) -
                     op["target"] = unit_uid_to_target[unit_uid]
 
 
-def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
+def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path, phase: str, model: str | None = None) -> None:
     """Run CLI command using appropriate backend.
     
     - codex: Uses native --output-schema (most reliable)
@@ -435,6 +438,7 @@ def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path
             schema_path=schema_path,
             output_path=output_path,
             phase=phase,
+            model=model,
         )
     elif cli == "claude":
         # Claude Code uses unified runner
@@ -449,6 +453,7 @@ def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path
             work_dir=REPO_ROOT,
             phase=phase,
             log_callback=log_callback,
+            model=model,
         )
     else:
         # Default codex (original behavior)
@@ -457,10 +462,11 @@ def _run_cli_exec(*, cli: str, prompt: str, schema_path: Path, output_path: Path
             schema_path=schema_path,
             output_path=output_path,
             phase=phase,
+            model=model,
         )
 
 
-def _run_codex(*, prompt: str, schema_path: Path, output_path: Path, phase: str) -> None:
+def _run_codex(*, prompt: str, schema_path: Path, output_path: Path, phase: str, model: str | None = None) -> None:
     """Run Codex CLI with native structured output."""
     cmd = [
         "codex",
@@ -471,6 +477,8 @@ def _run_codex(*, prompt: str, schema_path: Path, output_path: Path, phase: str)
         "--output-last-message", str(output_path),
         "-",
     ]
+    if model:
+        cmd.extend(["-m", model])
     _log_line("$ " + " ".join(cmd))
     
     proc = subprocess.Popen(
@@ -524,7 +532,7 @@ def _run_codex(*, prompt: str, schema_path: Path, output_path: Path, phase: str)
             proc.kill()
 
 
-def _run_kimi_with_retry(*, prompt: str, schema_path: Path, output_path: Path, phase: str, max_retries: int = 2) -> None:
+def _run_kimi_with_retry(*, prompt: str, schema_path: Path, output_path: Path, phase: str, max_retries: int = 2, model: str | None = None) -> None:
     """Run Kimi CLI with validation and retry logic.
     
     Unlike the old implementation that used Codex Spark for extraction,
@@ -569,6 +577,8 @@ CRITICAL: Output ONLY valid JSON. Fix ALL validation errors above."""
             "--output-format", "stream-json",
             "--prompt", current_prompt,
         ]
+        if model:
+            cmd.extend(["--model", model])
         
         _log_line(f"[{phase}] Running Kimi (attempt {attempt + 1}/{max_retries + 1})")
         
@@ -1231,7 +1241,7 @@ def _apply_chunk_boundary_fixes(paths: ProjectPaths, fixes: list[dict[str, Any]]
     return {"applied_fixes": applied, "chunk_count": len(chunks)}
 
 
-def _run_chunk_qa_with_optional_fix(paths: ProjectPaths, *, cli: str) -> dict[str, Any]:
+def _run_chunk_qa_with_optional_fix(paths: ProjectPaths, *, cli: str, model: str | None = None) -> dict[str, Any]:
     manifest_path = paths.chunks_output_dir / "manifest.json"
     manifest = _load_json(manifest_path)
     chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
@@ -1259,6 +1269,7 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths, *, cli: str) -> dict[st
         schema_path=SCHEMA_CHUNK_QA,
         output_path=paths.chunk_qa_report,
         phase="chunk QA pass 1",
+        model=model,
     )
     first_report = _load_json(paths.chunk_qa_report)
 
@@ -1299,6 +1310,7 @@ def _run_chunk_qa_with_optional_fix(paths: ProjectPaths, *, cli: str) -> dict[st
         schema_path=SCHEMA_CHUNK_QA,
         output_path=paths.chunk_qa_report,
         phase="chunk QA pass 2",
+        model=model,
     )
     second_report = _load_json(paths.chunk_qa_report)
     second_status = str(second_report.get("status", "")).strip()
@@ -1708,7 +1720,7 @@ def _sanitize_chunk_result_ops(
     return sanitized_payload, log_payload
 
 
-def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -> dict[str, Any]:
+def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, model: str | None = None) -> dict[str, Any]:
     manifest_path = paths.chunks_output_dir / "manifest.json"
     manifest = _load_json(manifest_path)
     chunk_entries = manifest.get("chunks", []) if isinstance(manifest, dict) else []
@@ -1748,6 +1760,7 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str) -
             schema_path=SCHEMA_CHUNK_REVIEW,
             output_path=output_path,
             phase=f"chunk review {chunk_id}",
+            model=model,
         )
 
         raw_payload = _load_json(output_path)
@@ -1806,30 +1819,78 @@ def _enforce_no_sanitized_chunk_ops(paths: ProjectPaths, review_summary: dict[st
     pass
 
 
+def _resolve_input_file(project_dir: Path, input_arg: str | None) -> Path:
+    """Resolve the input DOCX file based on --input arg or auto-detect.
+    
+    Rules:
+    1. If --input is provided, use that file
+    2. If --input is not provided and only one .docx exists, use that
+    3. If --input is not provided and multiple/no .docx exist, error
+    """
+    input_dir = project_dir / "input"
+    
+    if input_arg:
+        # User specified a file
+        input_path = input_dir / input_arg
+        if not input_path.exists():
+            raise FileNotFoundError(f"Specified input file not found: {input_path}")
+        if input_path.suffix.lower() != ".docx":
+            raise ValueError(f"Input file must be a .docx file: {input_path}")
+        return input_path.resolve()
+    
+    # Auto-detect: find all .docx files in input directory
+    docx_files = [f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() == ".docx"]
+    
+    if len(docx_files) == 0:
+        raise FileNotFoundError(f"No .docx files found in {input_dir}. Please add an input file or specify one with --input.")
+    
+    if len(docx_files) > 1:
+        available = ", ".join(sorted(f.name for f in docx_files))
+        raise RuntimeError(
+            f"Multiple input files found in {input_dir}: {available}. "
+            f"Please specify which one to process with --input <filename>"
+        )
+    
+    return docx_files[0].resolve()
+
+
 def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
     project_dir = (REPO_ROOT / "projects" / str(args.project)).resolve()
     workflow_xml = (project_dir / "workflows" / f"{args.workflow}.xml").resolve()
-
+    
+    # Resolve input file
+    source_docx = _resolve_input_file(project_dir, args.input)
+    input_name = source_docx.stem  # filename without extension
+    
+    # Build output paths based on input filename
+    # Intermediate artifacts go in subdirectories named after the input file
+    extract_output_dir = (project_dir / "artifacts" / "docx_extract" / input_name).resolve()
+    chunks_output_dir = (project_dir / "artifacts" / "chunks" / input_name).resolve()
+    chunk_results_dir = (project_dir / "artifacts" / "chunk_results" / input_name).resolve()
+    patch_output_dir = (project_dir / "artifacts" / "patch" / input_name).resolve()
+    apply_log_dir = (project_dir / "artifacts" / "apply" / input_name).resolve()
+    
     return ProjectPaths(
         project_dir=project_dir,
         workflow_xml=workflow_xml,
-        source_docx=(project_dir / "input" / "source.docx").resolve(),
+        source_docx=source_docx,
+        input_name=input_name,
         constants=(Path(args.constants).expanduser().resolve() if Path(args.constants).is_absolute() else (REPO_ROOT / Path(args.constants)).resolve()),
-        extract_output_dir=(project_dir / "artifacts" / "docx_extract").resolve(),
-        chunks_output_dir=(project_dir / "artifacts" / "chunks").resolve(),
-        chunk_results_dir=(project_dir / "artifacts" / "chunk_results").resolve(),
-        patch_output_dir=(project_dir / "artifacts" / "patch").resolve(),
-        merged_patch=(project_dir / "artifacts" / "patch" / "merged_patch.json").resolve(),
-        merge_report=(project_dir / "artifacts" / "patch" / "merge_report.json").resolve(),
-        final_patch=(project_dir / "artifacts" / "patch" / "final_patch.json").resolve(),
-        chunk_qa_report=(project_dir / "artifacts" / "chunks" / "chunk_qa_report.json").resolve(),
-        merge_qa_report=(project_dir / "artifacts" / "patch" / "merge_qa_report.json").resolve(),
-        final_patch_overrides=(project_dir / "artifacts" / "patch" / "final_patch_overrides.json").resolve(),
-        chunk_result_sanitization_log=(project_dir / "artifacts" / "chunk_results" / "sanitization_report.json").resolve(),
-        apply_log=(project_dir / "artifacts" / "apply" / "apply_log.json").resolve(),
-        annotated_docx=(project_dir / "output" / "annotated.docx").resolve(),
-        changes_md=(project_dir / "output" / "changes.md").resolve(),
-        changes_json=(project_dir / "output" / "changes.json").resolve(),
+        extract_output_dir=extract_output_dir,
+        chunks_output_dir=chunks_output_dir,
+        chunk_results_dir=chunk_results_dir,
+        patch_output_dir=patch_output_dir,
+        merged_patch=(patch_output_dir / "merged_patch.json").resolve(),
+        merge_report=(patch_output_dir / "merge_report.json").resolve(),
+        final_patch=(patch_output_dir / "final_patch.json").resolve(),
+        chunk_qa_report=(chunks_output_dir / "chunk_qa_report.json").resolve(),
+        merge_qa_report=(patch_output_dir / "merge_qa_report.json").resolve(),
+        final_patch_overrides=(patch_output_dir / "final_patch_overrides.json").resolve(),
+        chunk_result_sanitization_log=(chunk_results_dir / "sanitization_report.json").resolve(),
+        apply_log=(apply_log_dir / "apply_log.json").resolve(),
+        annotated_docx=(project_dir / "output" / f"{input_name}_annotated.docx").resolve(),
+        changes_md=(project_dir / "output" / f"{input_name}_changes.md").resolve(),
+        changes_json=(project_dir / "output" / f"{input_name}_changes.json").resolve(),
     )
 
 
@@ -1895,7 +1956,7 @@ def _resolve_action_index(action: dict[str, Any], base_ops: list[dict[str, Any]]
     return None
 
 
-def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str, cli: str) -> dict[str, Any]:
+def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str, cli: str, model: str | None = None) -> dict[str, Any]:
     prompt = _render_template(
         TEMPLATE_MERGE_QA,
         {
@@ -1909,6 +1970,7 @@ def _apply_merge_qa_overrides(paths: ProjectPaths, *, author: str, cli: str) -> 
         schema_path=SCHEMA_MERGE_QA,
         output_path=paths.merge_qa_report,
         phase="merge QA",
+        model=model,
     )
 
     merge_qa = _load_json(paths.merge_qa_report)
@@ -1998,7 +2060,17 @@ def run_pipeline(
     validate: bool,
     max_concurrency: int,
     cli: str,
+    model: str | None = None,
 ) -> SyntheticChunkResult | None:
+    # Build relative paths based on input name
+    input_rel_path = f"input/{paths.source_docx.name}"
+    extract_rel_dir = f"artifacts/docx_extract/{paths.input_name}"
+    chunks_rel_dir = f"artifacts/chunks/{paths.input_name}"
+    chunk_results_rel_dir = f"artifacts/chunk_results/{paths.input_name}"
+    patch_rel_dir = f"artifacts/patch/{paths.input_name}"
+    apply_rel_dir = f"artifacts/apply/{paths.input_name}"
+    output_docx_rel = f"output/{paths.input_name}_annotated.docx"
+    
     _run(
         [
             sys.executable,
@@ -2006,9 +2078,9 @@ def run_pipeline(
             "--project-dir",
             str(paths.project_dir),
             "--input-docx",
-            "input/source.docx",
+            input_rel_path,
             "--output-dir",
-            "artifacts/docx_extract",
+            extract_rel_dir,
         ]
     )
 
@@ -2021,13 +2093,13 @@ def run_pipeline(
             "--constants",
             str(paths.constants),
             "--review-units",
-            "artifacts/docx_extract/review_units.json",
+            f"{extract_rel_dir}/review_units.json",
             "--linear-units",
-            "artifacts/docx_extract/linear_units.json",
+            f"{extract_rel_dir}/linear_units.json",
             "--docx-struct",
-            "artifacts/docx_extract/docx_struct.json",
+            f"{extract_rel_dir}/docx_struct.json",
             "--output-dir",
-            "artifacts/chunks",
+            chunks_rel_dir,
         ]
     )
 
@@ -2036,9 +2108,9 @@ def run_pipeline(
         synthetic = _discover_synthetic_chunk_result(paths)
         _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
     else:
-        qa = _run_chunk_qa_with_optional_fix(paths, cli=cli)
+        qa = _run_chunk_qa_with_optional_fix(paths, cli=cli, model=model)
         _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
-        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency, cli=cli)
+        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency, cli=cli, model=model)
         _log_line(
             "Chunk reviews complete: "
             f"chunks={review_summary['chunk_count']} "
@@ -2054,15 +2126,15 @@ def run_pipeline(
             "--project-dir",
             str(paths.project_dir),
             "--chunk-results-dir",
-            "artifacts/chunk_results",
+            chunk_results_rel_dir,
             "--linear-units",
-            "artifacts/docx_extract/linear_units.json",
+            f"{extract_rel_dir}/linear_units.json",
             "--chunks-manifest",
-            "artifacts/chunks/manifest.json",
+            f"{chunks_rel_dir}/manifest.json",
             "--review-units",
-            "artifacts/docx_extract/review_units.json",
+            f"{extract_rel_dir}/review_units.json",
             "--output-dir",
-            "artifacts/patch",
+            patch_rel_dir,
             "--author",
             author,
         ]
@@ -2083,7 +2155,7 @@ def run_pipeline(
             },
         )
     else:
-        override_report = _apply_merge_qa_overrides(paths, author=author, cli=cli)
+        override_report = _apply_merge_qa_overrides(paths, author=author, cli=cli, model=model)
         _log_line(
             "Merge QA overrides: "
             f"actions_in={override_report['actions_in']} "
@@ -2098,15 +2170,15 @@ def run_pipeline(
             "--project-dir",
             str(paths.project_dir),
             "--input-docx",
-            "input/source.docx",
+            input_rel_path,
             "--patch",
-            "artifacts/patch/final_patch.json",
+            f"{patch_rel_dir}/final_patch.json",
             "--review-units",
-            "artifacts/docx_extract/review_units.json",
+            f"{extract_rel_dir}/review_units.json",
             "--output-docx",
-            "output/annotated.docx",
+            output_docx_rel,
             "--apply-log",
-            "artifacts/apply/apply_log.json",
+            f"{apply_rel_dir}/apply_log.json",
             "--author",
             author,
         ]
@@ -2119,15 +2191,15 @@ def run_pipeline(
             "--project-dir",
             str(paths.project_dir),
             "--review-units",
-            "artifacts/docx_extract/review_units.json",
+            f"{extract_rel_dir}/review_units.json",
             "--patch",
-            "artifacts/patch/final_patch.json",
+            f"{patch_rel_dir}/final_patch.json",
             "--apply-log",
-            "artifacts/apply/apply_log.json",
+            f"{apply_rel_dir}/apply_log.json",
             "--output-md",
-            "output/changes.md",
+            f"output/{paths.input_name}_changes.md",
             "--output-json",
-            "output/changes.json",
+            f"output/{paths.input_name}_changes.json",
         ]
     )
 
@@ -2145,7 +2217,7 @@ def main() -> int:
 
     try:
         paths = _resolve_paths(args)
-        _init_run_log(paths.project_dir / "artifacts" / "last_run.txt")
+        _init_run_log(paths.project_dir / "artifacts" / f"last_run_{paths.input_name}.txt")
         log_started = True
         _ensure_project_prereqs(paths)
 
@@ -2170,10 +2242,12 @@ def main() -> int:
             validate=not bool(args.skip_validation),
             max_concurrency=int(args.max_concurrency),
             cli=str(args.cli),
+            model=args.model,
         )
 
         _log_line("Project run completed successfully.")
         _log_line(f"Project: {paths.project_dir}")
+        _log_line(f"Input file: {paths.source_docx.name}")
         _log_line(f"Workflow: {paths.workflow_xml.name}")
         _log_line(f"Final patch: {paths.final_patch}")
         _log_line(f"Annotated DOCX: {paths.annotated_docx}")
