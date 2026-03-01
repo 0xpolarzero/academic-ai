@@ -11,7 +11,7 @@ All pipeline skills are being standardized to a single required CLI flag:
 Path resolution contract:
 
 - Input DOCX files are resolved under `--project-dir/input/`
-- All intermediate files are resolved under `<project-dir>/artifacts/<input_name>/...`
+- Intermediate files are resolved under `<project-dir>/artifacts/` with per-input subpaths
 - Final files are resolved under `<project-dir>/output/...`
 - Workflow files are resolved under `<project-dir>/workflows/...`
 
@@ -27,7 +27,10 @@ projects/<project_slug>/
   artifacts/
     docx_extract/<input_name>/
     chunks/<input_name>/
-    chunk_results/<input_name>/
+    ralph_0/chunk_results/<input_name>/
+    ralph_1/chunk_results/<input_name>/
+    ...
+    judged/chunk_results/<input_name>/
     patch/<input_name>/
     apply/<input_name>/
   output/
@@ -41,6 +44,7 @@ Agent contracts (used by `scripts/run_project.py`):
 - prompt templates in `templates/`:
   - `chunk_qa.xml`
   - `chunk_review.xml`
+  - `ralph_judge.xml`
   - `merge_qa.xml`
 - JSON output schemas in `schemas/`:
   - `chunk_qa.schema.json`
@@ -59,11 +63,11 @@ Deterministic chunk-boundary fixes (runner behavior):
 ## Path Rules
 
 - Final writer-facing outputs live in `projects/<project>/output/` only:
-  - `annotated.docx`
-  - `changes.md`
-  - `changes.json`
+  - `<input_name>_annotated.docx`
+  - `<input_name>_changes.md`
+  - `<input_name>_changes.json`
 - Intermediate/runtime artifacts live in `projects/<project>/artifacts/` only.
-- Source input DOCX is `projects/<project>/input/source.docx`.
+- Source input DOCX is any `.docx` under `projects/<project>/input/` (or `--input <filename>`).
 - Workflow policy is `projects/<project>/workflows/<workflow>.xml`.
 
 ## Prerequisites
@@ -108,6 +112,12 @@ make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
 # Process files one by one (outputs are never overwritten)
 make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
 make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter2.docx
+
+# Ralphing ensemble with 3 sequential review runs + judge reconciliation
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx RALPH=3
+
+# Skip judge and merge directly from ralph_0 results
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx RALPH=3 SKIP_JUDGE=1
 ```
 
 4. Read final outputs (named after the input file):
@@ -142,7 +152,8 @@ make test
 ```bash
 .venv/bin/python scripts/run_project.py \
   --project thesis \
-  --workflow fr_copyedit_conservative
+  --workflow fr_copyedit_conservative \
+  --ralph 1
 ```
 
 Specify an input file with `--input`:
@@ -161,6 +172,23 @@ Use `--dry-run` to avoid CLI calls and generate synthetic chunk review outputs:
   --project thesis \
   --workflow fr_copyedit_conservative \
   --dry-run
+```
+
+Use `--ralph N` to run ensemble reviews, and `--skip-judge` to use `ralph_0` directly:
+
+```bash
+.venv/bin/python scripts/run_project.py \
+  --project thesis \
+  --workflow fr_copyedit_conservative \
+  --input chapter1.docx \
+  --ralph 3
+
+.venv/bin/python scripts/run_project.py \
+  --project thesis \
+  --workflow fr_copyedit_conservative \
+  --input chapter1.docx \
+  --ralph 3 \
+  --skip-judge
 ```
 
 Use `--cli` to select the CLI provider (`codex` or `kimi`, default is `codex`):
@@ -182,11 +210,11 @@ make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative CLI=kimi
 
 - `Workflow XML not found`: create or verify `projects/<project>/workflows/<workflow>.xml`.
 - `Workflow name mismatch`: ensure workflow root has `<workflow name="<workflow>">`.
-- `Source DOCX not found`: place file at `projects/<project>/input/source.docx`.
+- `Source DOCX not found`: place a `.docx` file under `projects/<project>/input/` or pass `--input <filename>`.
 - `codex CLI was not found on PATH`: install/configure Codex CLI or run with `--dry-run`.
 - `kimi CLI was not found on PATH`: install Kimi CLI (https://moonshotai.github.io/kimi-cli/) or run with `--dry-run`.
-- `Chunk QA still failing after deterministic fixes`: inspect `projects/<project>/artifacts/chunks/chunk_qa_report.json`.
-- `Missing output files`: inspect `projects/<project>/artifacts/patch/merge_report.json` and `projects/<project>/artifacts/apply/apply_log.json`.
+- `Chunk QA still failing after deterministic fixes`: inspect `projects/<project>/artifacts/chunks/<input_name>/chunk_qa_report.json`.
+- `Missing output files`: inspect `projects/<project>/artifacts/patch/<input_name>/merge_report.json` and `projects/<project>/artifacts/apply/<input_name>/apply_log.json`.
 
 ## Notes
 

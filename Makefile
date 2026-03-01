@@ -7,6 +7,7 @@ FIXTURE_DOCX := fixtures/NPPF_December_2023.docx
 FIXTURE_URL := https://data.parliament.uk/DepositedPapers/Files/DEP2023-1029/NPPF_December_2023.docx
 PROJECT ?= thesis
 WORKFLOW ?= fr_copyedit_conservative
+RALPH ?= 1
 
 EXTRACT_SCRIPT := .codex/skills/docx_extract_ooxml_to_artifacts/scripts/extract_docx.py
 CHUNK_SCRIPT := .codex/skills/docx_chunk_atomic_manifest/scripts/chunk_docx.py
@@ -25,7 +26,7 @@ help:
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
 	@echo "  make report    # patch/apply -> output/changes.{md,json}"
 	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
-	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>] [DRY_RUN=1] [CLI=codex|kimi|claude] [MODEL=<model>]  # run project workflow"
+	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>] [DRY_RUN=1] [RALPH=N] [SKIP_JUDGE=1] [CLI=codex|kimi|claude] [MODEL=<model>]  # run project workflow"
 	@echo "  make test      # pytest unit + integration checks"
 	@echo "  make e2e       # offline thesis dry-run + acceptance checks"
 
@@ -60,6 +61,11 @@ run:
 	if [ -n "$(DRY_RUN)" ] && [ "$(DRY_RUN)" != "0" ] && [ "$(DRY_RUN)" != "false" ] && [ "$(DRY_RUN)" != "no" ]; then \
 		DRY_FLAG="--dry-run"; \
 	fi; \
+	RALPH_FLAG="--ralph $(RALPH)"; \
+	SKIP_JUDGE_FLAG=""; \
+	if [ -n "$(SKIP_JUDGE)" ] && [ "$(SKIP_JUDGE)" != "0" ] && [ "$(SKIP_JUDGE)" != "false" ] && [ "$(SKIP_JUDGE)" != "no" ]; then \
+		SKIP_JUDGE_FLAG="--skip-judge"; \
+	fi; \
 	CLI_FLAG=""; \
 	if [ -n "$(CLI)" ]; then \
 		CLI_FLAG="--cli $(CLI)"; \
@@ -72,7 +78,7 @@ run:
 	if [ -n "$(INPUT)" ]; then \
 		INPUT_FLAG="--input $(INPUT)"; \
 	fi; \
-	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$INPUT_FLAG $$DRY_FLAG $$CLI_FLAG $$MODEL_FLAG
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$INPUT_FLAG $$DRY_FLAG $$RALPH_FLAG $$SKIP_JUDGE_FLAG $$CLI_FLAG $$MODEL_FLAG
 
 fixtures:
 	@mkdir -p fixtures

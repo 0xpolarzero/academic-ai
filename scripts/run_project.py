@@ -41,6 +41,7 @@ VALIDATE_SCRIPT = REPO_ROOT / "scripts/validate_dry_run_outputs.py"
 TEMPLATE_CHUNK_QA = REPO_ROOT / "templates/chunk_qa.xml"
 TEMPLATE_CHUNK_REVIEW = REPO_ROOT / "templates/chunk_review.xml"
 TEMPLATE_MERGE_QA = REPO_ROOT / "templates/merge_qa.xml"
+TEMPLATE_RALPH_JUDGE = REPO_ROOT / "templates/ralph_judge.xml"
 
 SCHEMA_CHUNK_QA = REPO_ROOT / "schemas/chunk_qa.schema.json"
 SCHEMA_CHUNK_REVIEW = REPO_ROOT / "schemas/chunk_result.schema.json"
@@ -79,6 +80,10 @@ class ProjectPaths:
     constants: Path
     extract_output_dir: Path
     chunks_output_dir: Path
+    ralph_count: int
+    use_judge: bool
+    ralph_chunk_results_dirs: list[Path]
+    judged_chunk_results_dir: Path
     chunk_results_dir: Path
     patch_output_dir: Path
     merged_patch: Path
@@ -132,6 +137,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrency", type=int, default=4, help="Max concurrent chunk reviewers")
     parser.add_argument("--dry-run", action="store_true", help="Generate synthetic chunk results instead of model outputs")
     parser.add_argument("--skip-validation", action="store_true", help="Skip QA acceptance checks at the end")
+    parser.add_argument("--ralph", type=int, default=1, help="Number of sequential review ensemble runs (default: 1)")
+    parser.add_argument("--skip-judge", action="store_true", help="When --ralph > 1, skip judge and use ralph_0 results directly")
     parser.add_argument("--cli", default="codex", choices=("codex", "claude", "kimi"), help="CLI provider to use for AI calls: codex, claude (Claude Code), or kimi (default: codex)")
     parser.add_argument("--model", default=None, help="Model to use for AI calls (e.g., 'gpt-5.3-codex', 'kimi-k2', 'sonnet')")
     return parser
@@ -144,6 +151,22 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _dump_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _project_rel_path(project_dir: Path, path: Path) -> str:
+    return path.resolve().relative_to(project_dir.resolve()).as_posix()
+
+
+def _clear_chunk_result_artifacts(chunk_results_dir: Path) -> None:
+    chunk_results_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in (
+        "chunk_*_result.json",
+        "chunk_*_sanitization.json",
+        "chunk_*_result.raw.json",
+        "sanitization_report.json",
+    ):
+        for stale in chunk_results_dir.glob(pattern):
+            stale.unlink()
 
 
 def _run(cmd: list[str]) -> None:
@@ -1720,19 +1743,23 @@ def _sanitize_chunk_result_ops(
     return sanitized_payload, log_payload
 
 
-def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, model: str | None = None) -> dict[str, Any]:
+def _run_chunk_reviews(
+    paths: ProjectPaths,
+    *,
+    chunk_results_dir: Path,
+    sanitization_log_path: Path,
+    max_concurrency: int,
+    cli: str,
+    model: str | None = None,
+    phase_label: str = "chunk review",
+) -> dict[str, Any]:
     manifest_path = paths.chunks_output_dir / "manifest.json"
     manifest = _load_json(manifest_path)
     chunk_entries = manifest.get("chunks", []) if isinstance(manifest, dict) else []
     if not isinstance(chunk_entries, list) or not chunk_entries:
         raise RuntimeError("Chunk manifest has no chunks for review")
 
-    for stale in paths.chunk_results_dir.glob("chunk_*_result.json"):
-        stale.unlink()
-    for stale in paths.chunk_results_dir.glob("chunk_*_sanitization.json"):
-        stale.unlink()
-    for stale in paths.chunk_results_dir.glob("chunk_*_result.raw.json"):
-        stale.unlink()
+    _clear_chunk_result_artifacts(chunk_results_dir)
 
     def process_chunk(entry: dict[str, Any]) -> dict[str, Any]:
         chunk_id = str(entry.get("chunk_id", "")).strip()
@@ -1744,7 +1771,7 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, m
         if not chunk_path.exists():
             raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
 
-        output_path = paths.chunk_results_dir / f"{chunk_id}_result.json"
+        output_path = chunk_results_dir / f"{chunk_id}_result.json"
         workflow_xml = paths.workflow_xml.read_text(encoding="utf-8")
         prompt = _render_template(
             TEMPLATE_CHUNK_REVIEW,
@@ -1759,14 +1786,14 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, m
             prompt=prompt,
             schema_path=SCHEMA_CHUNK_REVIEW,
             output_path=output_path,
-            phase=f"chunk review {chunk_id}",
+            phase=f"{phase_label} {chunk_id}",
             model=model,
         )
 
         raw_payload = _load_json(output_path)
-        _dump_json(paths.chunk_results_dir / f"{chunk_id}_result.raw.json", raw_payload)
+        _dump_json(chunk_results_dir / f"{chunk_id}_result.raw.json", raw_payload)
         chunk_payload = _load_json(chunk_path)
-        
+
         # Normalize Kimi's output format if needed
         if cli == "kimi":
             _normalize_kimi_ops(raw_payload, chunk_payload)
@@ -1776,7 +1803,7 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, m
             chunk_payload=chunk_payload,
         )
         _dump_json(output_path, sanitized_payload)
-        _dump_json(paths.chunk_results_dir / f"{chunk_id}_sanitization.json", log_payload)
+        _dump_json(chunk_results_dir / f"{chunk_id}_sanitization.json", log_payload)
 
         return {
             "chunk_id": chunk_id,
@@ -1810,7 +1837,133 @@ def _run_chunk_reviews(paths: ProjectPaths, *, max_concurrency: int, cli: str, m
         "total_output_ops": sum(int(item.get("output_ops", 0)) for item in summaries),
         "chunks": summaries,
     }
-    _dump_json(paths.chunk_result_sanitization_log, aggregate)
+    _dump_json(sanitization_log_path, aggregate)
+    return aggregate
+
+
+def _run_single_ralph_review(
+    paths: ProjectPaths,
+    *,
+    ralph_index: int,
+    max_concurrency: int,
+    cli: str,
+    model: str | None = None,
+) -> dict[str, Any]:
+    if ralph_index < 0 or ralph_index >= len(paths.ralph_chunk_results_dirs):
+        raise RuntimeError(f"Invalid ralph index: {ralph_index}")
+
+    output_dir = paths.ralph_chunk_results_dirs[ralph_index]
+    log_path = output_dir / "sanitization_report.json"
+
+    _log_line(
+        f"Ralph run {ralph_index + 1}/{paths.ralph_count} "
+        f"output_dir={output_dir}"
+    )
+    return _run_chunk_reviews(
+        paths,
+        chunk_results_dir=output_dir,
+        sanitization_log_path=log_path,
+        max_concurrency=max_concurrency,
+        cli=cli,
+        model=model,
+        phase_label=f"ralph {ralph_index} chunk review",
+    )
+
+
+def _run_judge_phase(paths: ProjectPaths, *, cli: str, model: str | None = None) -> dict[str, Any]:
+    manifest_path = paths.chunks_output_dir / "manifest.json"
+    manifest = _load_json(manifest_path)
+    chunk_entries = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    if not isinstance(chunk_entries, list) or not chunk_entries:
+        raise RuntimeError("Chunk manifest has no chunks for judge phase")
+
+    _clear_chunk_result_artifacts(paths.judged_chunk_results_dir)
+    workflow_xml = paths.workflow_xml.read_text(encoding="utf-8")
+
+    summaries: list[dict[str, Any]] = []
+    for entry in chunk_entries:
+        if not isinstance(entry, dict):
+            continue
+
+        chunk_id = str(entry.get("chunk_id", "")).strip()
+        rel_path = str(entry.get("path", "")).strip()
+        if not chunk_id or not rel_path:
+            raise RuntimeError("Manifest chunk entry is missing chunk_id/path")
+
+        chunk_path = paths.chunks_output_dir / rel_path
+        if not chunk_path.exists():
+            raise FileNotFoundError(f"Chunk file missing: {chunk_path}")
+
+        proposal_paths: list[Path] = []
+        for ralph_dir in paths.ralph_chunk_results_dirs:
+            proposal_path = ralph_dir / f"{chunk_id}_result.json"
+            if not proposal_path.exists():
+                raise FileNotFoundError(
+                    "Judge phase missing ralph proposal: "
+                    f"chunk={chunk_id} path={proposal_path}"
+                )
+            proposal_paths.append(proposal_path)
+
+        output_path = paths.judged_chunk_results_dir / f"{chunk_id}_result.json"
+        prompt = _render_template(
+            TEMPLATE_RALPH_JUDGE,
+            {
+                "WORKFLOW_XML": workflow_xml,
+                "CHUNK_PATH": str(chunk_path.resolve()),
+                "RALPH_COUNT": str(paths.ralph_count),
+                "PROPOSAL_PATHS": "\n".join(str(path.resolve()) for path in proposal_paths),
+            },
+        )
+
+        _log_line(f"Judge start: {chunk_id}")
+        _run_cli_exec(
+            cli=cli,
+            prompt=prompt,
+            schema_path=SCHEMA_CHUNK_REVIEW,
+            output_path=output_path,
+            phase=f"ralph judge {chunk_id}",
+            model=model,
+        )
+
+        raw_payload = _load_json(output_path)
+        _dump_json(paths.judged_chunk_results_dir / f"{chunk_id}_result.raw.json", raw_payload)
+        chunk_payload = _load_json(chunk_path)
+
+        if cli == "kimi":
+            _normalize_kimi_ops(raw_payload, chunk_payload)
+        sanitized_payload, log_payload = _sanitize_chunk_result_ops(
+            chunk_id=chunk_id,
+            raw_payload=raw_payload,
+            chunk_payload=chunk_payload,
+        )
+        _dump_json(output_path, sanitized_payload)
+        _dump_json(paths.judged_chunk_results_dir / f"{chunk_id}_sanitization.json", log_payload)
+
+        summaries.append(
+            {
+                "chunk_id": chunk_id,
+                "result_path": str(output_path),
+                "input_ops": log_payload["input_op_count"],
+                "output_ops": log_payload["output_op_count"],
+            }
+        )
+        _log_line(
+            "Judge done: "
+            f"{chunk_id} "
+            f"input_ops={log_payload['input_op_count']} "
+            f"output_ops={log_payload['output_op_count']}"
+        )
+
+    summaries.sort(key=lambda item: str(item.get("chunk_id", "")))
+    aggregate = {
+        "chunk_count": len(summaries),
+        "total_input_ops": sum(int(item.get("input_ops", 0)) for item in summaries),
+        "total_output_ops": sum(int(item.get("output_ops", 0)) for item in summaries),
+        "chunks": summaries,
+        "ralph_count": paths.ralph_count,
+        "source_dirs": [str(path) for path in paths.ralph_chunk_results_dirs],
+    }
+    _dump_json(paths.judged_chunk_results_dir / "sanitization_report.json", aggregate)
     return aggregate
 
 
@@ -1857,19 +2010,29 @@ def _resolve_input_file(project_dir: Path, input_arg: str | None) -> Path:
 def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
     project_dir = (REPO_ROOT / "projects" / str(args.project)).resolve()
     workflow_xml = (project_dir / "workflows" / f"{args.workflow}.xml").resolve()
-    
+
     # Resolve input file
     source_docx = _resolve_input_file(project_dir, args.input)
     input_name = source_docx.stem  # filename without extension
-    
+
+    ralph_count = int(getattr(args, "ralph", 1))
+    if ralph_count < 1:
+        raise ValueError("--ralph must be >= 1")
+    use_judge = ralph_count > 1 and not bool(getattr(args, "skip_judge", False))
+
     # Build output paths based on input filename
     # Intermediate artifacts go in subdirectories named after the input file
     extract_output_dir = (project_dir / "artifacts" / "docx_extract" / input_name).resolve()
     chunks_output_dir = (project_dir / "artifacts" / "chunks" / input_name).resolve()
-    chunk_results_dir = (project_dir / "artifacts" / "chunk_results" / input_name).resolve()
+    ralph_chunk_results_dirs = [
+        (project_dir / "artifacts" / f"ralph_{index}" / "chunk_results" / input_name).resolve()
+        for index in range(ralph_count)
+    ]
+    judged_chunk_results_dir = (project_dir / "artifacts" / "judged" / "chunk_results" / input_name).resolve()
+    chunk_results_dir = judged_chunk_results_dir if use_judge else ralph_chunk_results_dirs[0]
     patch_output_dir = (project_dir / "artifacts" / "patch" / input_name).resolve()
     apply_log_dir = (project_dir / "artifacts" / "apply" / input_name).resolve()
-    
+
     return ProjectPaths(
         project_dir=project_dir,
         workflow_xml=workflow_xml,
@@ -1878,6 +2041,10 @@ def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
         constants=(Path(args.constants).expanduser().resolve() if Path(args.constants).is_absolute() else (REPO_ROOT / Path(args.constants)).resolve()),
         extract_output_dir=extract_output_dir,
         chunks_output_dir=chunks_output_dir,
+        ralph_count=ralph_count,
+        use_judge=use_judge,
+        ralph_chunk_results_dirs=ralph_chunk_results_dirs,
+        judged_chunk_results_dir=judged_chunk_results_dir,
         chunk_results_dir=chunk_results_dir,
         patch_output_dir=patch_output_dir,
         merged_patch=(patch_output_dir / "merged_patch.json").resolve(),
@@ -1914,15 +2081,19 @@ def _ensure_project_prereqs(paths: ProjectPaths) -> None:
     if not paths.constants.exists():
         raise FileNotFoundError(f"constants.json not found: {paths.constants}")
 
-    for path in [
+    required_dirs = [
         paths.extract_output_dir,
         paths.chunks_output_dir,
-        paths.chunk_results_dir,
         paths.patch_output_dir,
         paths.apply_log.parent,
         paths.annotated_docx.parent,
         paths.changes_md.parent,
-    ]:
+        paths.judged_chunk_results_dir,
+        paths.chunk_results_dir,
+    ]
+    required_dirs.extend(paths.ralph_chunk_results_dirs)
+
+    for path in required_dirs:
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -2062,14 +2233,13 @@ def run_pipeline(
     cli: str,
     model: str | None = None,
 ) -> SyntheticChunkResult | None:
-    # Build relative paths based on input name
     input_rel_path = f"input/{paths.source_docx.name}"
-    extract_rel_dir = f"artifacts/docx_extract/{paths.input_name}"
-    chunks_rel_dir = f"artifacts/chunks/{paths.input_name}"
-    chunk_results_rel_dir = f"artifacts/chunk_results/{paths.input_name}"
-    patch_rel_dir = f"artifacts/patch/{paths.input_name}"
-    apply_rel_dir = f"artifacts/apply/{paths.input_name}"
-    output_docx_rel = f"output/{paths.input_name}_annotated.docx"
+    extract_rel_dir = _project_rel_path(paths.project_dir, paths.extract_output_dir)
+    chunks_rel_dir = _project_rel_path(paths.project_dir, paths.chunks_output_dir)
+    chunk_results_rel_dir = _project_rel_path(paths.project_dir, paths.chunk_results_dir)
+    patch_rel_dir = _project_rel_path(paths.project_dir, paths.patch_output_dir)
+    apply_rel_dir = _project_rel_path(paths.project_dir, paths.apply_log.parent)
+    output_docx_rel = _project_rel_path(paths.project_dir, paths.annotated_docx)
     
     _run(
         [
@@ -2105,19 +2275,47 @@ def run_pipeline(
 
     synthetic: SyntheticChunkResult | None = None
     if dry_run:
+        if paths.ralph_count > 1:
+            _log_line(
+                "Dry-run mode ignores additional ralph runs and writes a single synthetic result set "
+                f"to {paths.chunk_results_dir}"
+            )
+        _clear_chunk_result_artifacts(paths.chunk_results_dir)
         synthetic = _discover_synthetic_chunk_result(paths)
         _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
     else:
         qa = _run_chunk_qa_with_optional_fix(paths, cli=cli, model=model)
         _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
-        review_summary = _run_chunk_reviews(paths, max_concurrency=max_concurrency, cli=cli, model=model)
-        _log_line(
-            "Chunk reviews complete: "
-            f"chunks={review_summary['chunk_count']} "
-            f"input_ops={review_summary['total_input_ops']} "
-            f"output_ops={review_summary['total_output_ops']}"
-        )
-        _enforce_no_sanitized_chunk_ops(paths, review_summary)
+        ralph_summaries: list[dict[str, Any]] = []
+        for ralph_index in range(paths.ralph_count):
+            review_summary = _run_single_ralph_review(
+                paths,
+                ralph_index=ralph_index,
+                max_concurrency=max_concurrency,
+                cli=cli,
+                model=model,
+            )
+            ralph_summaries.append(review_summary)
+            _log_line(
+                f"Ralph run {ralph_index + 1}/{paths.ralph_count} complete: "
+                f"chunks={review_summary['chunk_count']} "
+                f"input_ops={review_summary['total_input_ops']} "
+                f"output_ops={review_summary['total_output_ops']}"
+            )
+
+        if paths.use_judge:
+            judge_summary = _run_judge_phase(paths, cli=cli, model=model)
+            _log_line(
+                "Judge phase complete: "
+                f"chunks={judge_summary['chunk_count']} "
+                f"input_ops={judge_summary['total_input_ops']} "
+                f"output_ops={judge_summary['total_output_ops']}"
+            )
+            _enforce_no_sanitized_chunk_ops(paths, judge_summary)
+        else:
+            _log_line("Judge phase skipped; merge will use ralph_0 results.")
+            if ralph_summaries:
+                _enforce_no_sanitized_chunk_ops(paths, ralph_summaries[0])
 
     _run(
         [
@@ -2226,14 +2424,12 @@ def main() -> int:
             paths.merge_qa_report,
             paths.final_patch,
             paths.final_patch_overrides,
-            paths.chunk_result_sanitization_log,
         ]:
             if stale.exists():
                 stale.unlink()
 
-        if args.dry_run:
-            for stale in paths.chunk_results_dir.glob("chunk_*_result.json"):
-                stale.unlink()
+        for chunk_results_dir in [*paths.ralph_chunk_results_dirs, paths.judged_chunk_results_dir]:
+            _clear_chunk_result_artifacts(chunk_results_dir)
 
         synthetic = run_pipeline(
             paths,
@@ -2249,6 +2445,9 @@ def main() -> int:
         _log_line(f"Project: {paths.project_dir}")
         _log_line(f"Input file: {paths.source_docx.name}")
         _log_line(f"Workflow: {paths.workflow_xml.name}")
+        _log_line(f"Ralph runs: {paths.ralph_count}")
+        _log_line(f"Judge enabled: {paths.use_judge}")
+        _log_line(f"Chunk results used for merge: {paths.chunk_results_dir}")
         _log_line(f"Final patch: {paths.final_patch}")
         _log_line(f"Annotated DOCX: {paths.annotated_docx}")
         _log_line(f"Change report: {paths.changes_md}")
