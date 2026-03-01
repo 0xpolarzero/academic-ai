@@ -47,9 +47,10 @@ def _build_codex_command(
     schema_path: Path,
     work_dir: Path,
     output_path: Path,
+    model: str | None = None,
 ) -> list[str]:
     """Build Codex CLI command."""
-    return [
+    cmd = [
         "codex",
         "exec",
         "--cd", str(work_dir),
@@ -58,6 +59,9 @@ def _build_codex_command(
         "--output-last-message", str(output_path),
         "-",
     ]
+    if model:
+        cmd.extend(["-m", model])
+    return cmd
 
 
 def _build_claude_command(
@@ -65,6 +69,7 @@ def _build_claude_command(
     prompt: str,
     schema_path: Path,
     work_dir: Path,
+    model: str | None = None,
 ) -> list[str]:
     """Build Claude Code CLI command with JSON schema support.
     
@@ -81,13 +86,16 @@ def _build_claude_command(
 You must output your response as valid JSON matching the provided schema.
 Be precise and follow the schema exactly."""
 
-    return [
+    cmd = [
         "claude",
         "-p", structured_prompt,
         "--output-format", "json",
         "--json-schema", schema_content,
         "--dangerously-skip-permissions",  # Auto-approve for non-interactive
     ]
+    if model:
+        cmd.extend(["--model", model])
+    return cmd
 
 
 def _build_kimi_command(
@@ -95,6 +103,7 @@ def _build_kimi_command(
     prompt: str,
     work_dir: Path,
     schema_content: str | None = None,
+    model: str | None = None,
 ) -> list[str]:
     """Build Kimi CLI command."""
     system_context = """You are a JSON-only API. Your task is to analyze the provided content and return ONLY valid JSON.
@@ -121,7 +130,7 @@ Your entire response must be a single JSON object that passes validation."""
 
 REMEMBER: Output ONLY the JSON object. No markdown, no explanations."""
 
-    return [
+    cmd = [
         "kimi",
         "--work-dir", str(work_dir),
         "--yolo",
@@ -129,6 +138,9 @@ REMEMBER: Output ONLY the JSON object. No markdown, no explanations."""
         "--output-format", "stream-json",
         "--prompt", enhanced_prompt,
     ]
+    if model:
+        cmd.extend(["--model", model])
+    return cmd
 
 
 def _parse_claude_output(raw_output: str) -> dict[str, Any]:
@@ -173,6 +185,7 @@ def run_cli_exec(
     work_dir: Path,
     phase: str,
     log_callback: callable | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Run a CLI command (codex, claude, or kimi) with structured output.
     
@@ -184,6 +197,7 @@ def run_cli_exec(
         work_dir: Working directory
         phase: Phase name for logging
         log_callback: Optional callback for log messages (func(message, stderr=False))
+        model: Optional model name to use (e.g., 'gpt-5.3-codex', 'kimi-k2', 'sonnet')
     
     Returns:
         The parsed JSON output as a dict
@@ -207,6 +221,7 @@ def run_cli_exec(
             work_dir=work_dir,
             phase=phase,
             log=_log,
+            model=model,
         )
     elif cli == "claude":
         return _run_claude(
@@ -216,6 +231,7 @@ def run_cli_exec(
             work_dir=work_dir,
             phase=phase,
             log=_log,
+            model=model,
         )
     elif cli == "kimi":
         return _run_kimi(
@@ -225,6 +241,7 @@ def run_cli_exec(
             work_dir=work_dir,
             phase=phase,
             log=_log,
+            model=model,
         )
     else:
         raise ValueError(f"Unknown CLI: {cli}. Use 'codex', 'claude', or 'kimi'")
@@ -238,6 +255,7 @@ def _run_codex(
     work_dir: Path,
     phase: str,
     log: callable,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Run Codex CLI with structured output."""
     cmd = _build_codex_command(
@@ -245,6 +263,7 @@ def _run_codex(
         schema_path=schema_path,
         work_dir=work_dir,
         output_path=output_path,
+        model=model,
     )
     
     log(f"[{phase}] Running Codex: {' '.join(cmd[:6])}...")
@@ -315,6 +334,7 @@ def _run_claude(
     work_dir: Path,
     phase: str,
     log: callable,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Run Claude Code CLI with structured output.
     
@@ -325,6 +345,7 @@ the JSON response to extract structured_output.
         prompt=prompt,
         schema_path=schema_path,
         work_dir=work_dir,
+        model=model,
     )
     
     log(f"[{phase}] Running Claude Code: {' '.join(cmd[:4])}...")
@@ -410,34 +431,157 @@ def _run_kimi(
     work_dir: Path,
     phase: str,
     log: callable,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Run Kimi CLI with validation and retry.
     
-    Falls back to the kimi_json_runner logic since Kimi CLI doesn't
-    have native structured output support.
+    Uses stream-json output and validates against schema.
     """
-    # Import here to avoid circular imports at module level
-    import sys
-    _scripts_dir = Path(__file__).parent
-    if str(_scripts_dir) not in sys.path:
-        sys.path.insert(0, str(_scripts_dir))
-    from kimi_json_runner import run_kimi_with_retry
+    import json
+    import re
     
-    log(f"[{phase}] Running Kimi with retry logic...")
+    schema_content = _load_schema_content(schema_path)
     
-    # Use the existing kimi_json_runner
-    result = run_kimi_with_retry(
-        prompt=prompt,
-        schema_path=schema_path,
-        work_dir=work_dir,
-        output_path=output_path,
-        max_retries=2,
-        timeout_seconds=CLI_EXEC_TIMEOUT_SECONDS,
-        verbose=False,
+    # Build a prompt that strongly encourages valid JSON output
+    structured_prompt = f"""You are a JSON-only API. Return ONLY valid JSON matching the schema below.
+
+=== TASK ===
+{prompt}
+
+=== SCHEMA ===
+{schema_content}
+
+=== RULES ===
+1. Output MUST be valid, parseable JSON
+2. Do NOT wrap in ```json code blocks - output raw JSON only
+3. Do NOT include explanations or conversational text
+4. Every required field must be present
+5. Use empty strings "" for optional fields you don't populate
+6. Use empty arrays [] for array fields with no items
+
+Output ONLY the JSON object, nothing else."""
+
+    cmd = [
+        "kimi",
+        "--work-dir", str(work_dir),
+        "--yolo",
+        "--print",
+        "--output-format", "stream-json",
+        "--prompt", structured_prompt,
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    
+    log(f"[{phase}] Running Kimi...")
+    
+    proc = subprocess.Popen(
+        cmd,
+        cwd=work_dir,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
     
-    log(f"[{phase}] Kimi completed successfully")
-    return result
+    json_lines: list[str] = []
+    
+    try:
+        assert proc.stdout is not None
+        
+        deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                raise RuntimeError(f"Kimi timed out after {CLI_EXEC_TIMEOUT_SECONDS}s")
+            
+            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    stripped = line.strip()
+                    if stripped:
+                        json_lines.append(stripped)
+                    continue
+            
+            if proc.poll() is not None:
+                break
+        
+        # Read remaining output
+        tail = proc.stdout.read()
+        if tail:
+            for line in tail.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    json_lines.append(stripped)
+        
+        returncode = proc.wait()
+        
+        # Extract text from kimi stream-json output
+        text_parts: list[str] = []
+        for line in json_lines:
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict) and parsed.get("role") == "assistant":
+                    content = parsed.get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                if text:
+                                    text_parts.append(text)
+                    elif isinstance(content, str):
+                        text_parts.append(content)
+            except json.JSONDecodeError:
+                continue
+        
+        raw_text = "".join(text_parts)
+        
+        # Try to extract JSON from text
+        result = None
+        text = raw_text.strip()
+        
+        # Try direct parse first
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        
+        # Try removing markdown code blocks
+        if result is None:
+            match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group(1).strip())
+                except json.JSONDecodeError:
+                    pass
+        
+        # Try finding JSON object/array
+        if result is None:
+            for pattern in [r'(\{[\s\S]*\})', r'(\[[\s\S]*\])']:
+                matches = list(re.finditer(pattern, text))
+                for match in sorted(matches, key=lambda m: len(m.group(1)), reverse=True):
+                    try:
+                        result = json.loads(match.group(1).strip())
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                if result is not None:
+                    break
+        
+        if result is None:
+            raise RuntimeError(f"Could not parse valid JSON from Kimi output")
+        
+        # Save result
+        output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        
+        log(f"[{phase}] Kimi completed successfully")
+        return result
+        
+    finally:
+        if proc.poll() is None:
+            proc.kill()
 
 
 def detect_available_cli() -> str | None:

@@ -414,6 +414,20 @@ def _strip_boundary_spaces(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
+def _normalize_spaces(text: str) -> str:
+    """
+    Normalize multiple consecutive spaces to a single space.
+    
+    This prevents double spaces that occur when deleting words
+    (e.g., "et  la" from "et notamment la").
+    
+    Returns:
+        Text with normalized spaces
+    """
+    import re
+    return re.sub(r'\s+', ' ', text)
+
+
 def _is_word_boundary(text: str, pos: int) -> bool:
     """Check if position is at a word boundary (start/end of string, whitespace, or punctuation)."""
     if pos <= 0 or pos >= len(text):
@@ -534,15 +548,8 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
     new_is_whitespace_only = not new_text or (original_new_text and original_new_text.strip() == "")
     
     if old_is_whitespace_only and new_is_whitespace_only:
-        # Both sides are whitespace-only, show appropriate marker
-        if original_old_text == " ":
-            return "*(space removed)*", "*(deleted)*"
-        elif original_old_text:
-            return "*(whitespace removed)*", "*(deleted)*"
-        elif original_new_text == " ":
-            return "*(space added)*", "**(space)**"
-        else:
-            return "*(whitespace added)*", "*(added)*"
+        # Both sides are whitespace-only - skip these as they're not meaningful changes
+        return "", ""
     
     if not context:
         # No context, just show the minimal diff
@@ -557,17 +564,26 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         
         at_result = old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:]
         suggestion_result = new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:]
+        # For pure deletions with no context, show a marker
+        if not suggestion_result or suggestion_result == "****":
+            suggestion_result = "*(deleted)*"
         return at_result.strip(), suggestion_result.strip()
     
     if not old_text:
-        return f"**{old_text}**", f"**{new_text}**" if new_text else "*(deleted)*"
+        return f"**{old_text}**", f"**{new_text}**" if new_text else ""
     
     # Find old_text at a word boundary to avoid partial word matches
     # (e.g., finding "ce" inside "ces", "les" inside "agricoles")
     idx = _find_with_word_boundary(context, old_text)
     if idx < 0:
         # Old text not found as a complete word in context, fall back to showing both
-        return f"**{old_text}**", f"**{new_text}**" if new_text else "*(deleted)*"
+        # For deletions (empty new_text), show the old text bolded in At column,
+        # and the suggestion shows context with the text removed (no marker needed)
+        if new_text:
+            return f"**{old_text}**", f"**{new_text}**"
+        else:
+            # Deletion: show bolded old text, suggestion is just empty
+            return f"**{old_text}**", ""
     
     # Split context into before, target, after
     before = context[:idx]
@@ -584,26 +600,65 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
     old_changed = old_text[old_start:old_end] if not old_is_empty else ""
     new_changed = new_text[new_start:new_end] if not new_is_empty else ""
     
-    # If the only change is whitespace, show a clear marker
-    if old_changed and not new_changed and old_changed.strip() == "":
-        # Whitespace was removed (e.g., "word ." -> "word.")
-        at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
-        suggestion_formatted = before + old_text[:old_start] + old_text[old_end:] + after
-        return at_formatted.strip(), suggestion_formatted.strip()
+    # Check if this is a whitespace-only change BEFORE stripping boundary spaces
+    # This handles cases like "50.Les" -> "50. Les" where the only change is a space
+    is_whitespace_only_change = (
+        (old_changed and not new_changed and old_changed.strip() == "") or
+        (not old_changed and new_changed and new_changed.strip() == "") or
+        (old_changed and new_changed and old_changed.strip() == new_changed.strip() == "")
+    )
     
-    if not old_changed and new_changed and new_changed.strip() == "":
-        # Whitespace was added
-        at_formatted = before + old_text + after
-        suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
+    if is_whitespace_only_change:
+        # For whitespace-only changes, preserve the whitespace for display
+        # Don't use _strip_boundary_spaces as it would remove the very whitespace we're highlighting
+        if old_changed and not new_changed:
+            # Whitespace was removed (e.g., "word ." -> "word.")
+            at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
+            suggestion_formatted = before + old_text[:old_start] + old_text[old_end:] + after
+        elif not old_changed and new_changed:
+            # Whitespace was added (e.g., "50.Les" -> "50. Les")
+            # Build suggestion showing the space within the context
+            # new_text[:new_start] + new_changed + new_text[new_end:] = complete new_text
+            at_formatted = before + old_text + after
+            suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
+        else:
+            # Whitespace was replaced (unlikely but handle it)
+            at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
+            suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
         return at_formatted.strip(), suggestion_formatted.strip()
     
     if old_is_empty and not new_is_empty:
-        # Pure insertion (e.g., "Hongrie" -> "de la Hongrie")
-        # The old_text is entirely contained in new_text as a suffix
-        # Bold the entire old_text in At column
-        # Show the full new_text with the insertion bolded in Suggestion
-        at_formatted = before + f"**{old_text}**" + after
-        suggestion_formatted = before + f"**{new_text}**" + after
+        # The "changed" portion of old is empty, meaning the diff is entirely 
+        # new content. This can be:
+        # 1. PREFIX insertion: new content at start (e.g., "Hongrie" -> "de la Hongrie")
+        # 2. SUFFIX addition: new content at end (e.g., "commodité" -> "commodités")
+        # 3. MID insertion: new content replacing matched suffix (e.g., "ant" -> "aient")
+        if old_text:
+            # Determine where the new content goes
+            if prefix_len == 0:
+                # PREFIX insertion: new_changed comes BEFORE old_text
+                new_changed_stripped = new_changed.rstrip()
+                at_formatted = before + f"**{old_text}**" + after
+                suggestion_formatted = before + f"**{new_changed_stripped}** " + old_text + after
+            elif prefix_len >= len(old_text):
+                # SUFFIX addition: new_changed comes AFTER old_text
+                # e.g., "potentielle" -> "potentielles": new_changed="s"
+                at_formatted = before + f"**{old_text}**" + after
+                # For suffix addition, bold the entire new_text for clarity
+                # This avoids awkward output like "word**s**" instead of "**words**"
+                suggestion_formatted = before + f"**{new_text}**" + after
+            else:
+                # MID insertion: old_text is split by the change
+                # e.g., "engrangeant" -> "engrangeaient": "engrangea" + "ie" + "nt"
+                # The suffix "nt" was matched but should be AFTER the new content
+                # Show full new_text bolded for clarity
+                at_formatted = before + f"**{old_text}**" + after
+                suggestion_formatted = before + f"**{new_text}**" + after
+            suggestion_formatted = _normalize_spaces(suggestion_formatted)
+        else:
+            # True insertion (old_text was empty)
+            at_formatted = before + after
+            suggestion_formatted = before + f"**{new_text}**" + after
     elif new_is_empty and not old_is_empty:
         # Pure deletion within the text
         # Strip boundary spaces to prevent '** de**' or '**être **'
@@ -611,7 +666,13 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         old_changed = old_text[old_start:old_end]
         at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
         # Remove the deleted portion for suggestion
+        # Fix double spaces: if before ends with space and after starts with space, normalize
         suggestion_formatted = before + old_text[:old_start] + old_text[old_end:] + after
+        # Normalize spaces to prevent "et  la" (double space)
+        suggestion_formatted = _normalize_spaces(suggestion_formatted)
+        # If no context remains after deletion, show a marker
+        if not suggestion_formatted:
+            suggestion_formatted = "*(deleted)*"
     elif old_is_empty and new_is_empty:
         # No change at all (shouldn't happen)
         at_formatted = context
@@ -628,9 +689,26 @@ def format_replacement(context: str, old_text: str, new_text: str) -> tuple[str,
         # Build the At column
         at_formatted = before + old_text[:old_start] + f"**{old_changed}**" + old_text[old_end:] + after
         
-        # Build the Suggestion column using same structure
-        # We need to construct new_text within the context position
-        suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text[new_end:] + after
+        # Build the Suggestion column
+        # Check for overlap: if new_text ends with text that matches start of 'after'
+        # e.g., new_text="ensemble des", after=" des activités" -> overlap=" des"
+        suggestion_after = after
+        new_text_remainder = new_text[new_end:]
+        
+        # Check if the changed portion (new_changed) ends with text matching start of after
+        # This handles cases where new_text="ensemble des" and after=" des..."
+        if new_changed and suggestion_after:
+            # Strip leading space from after for overlap check (but preserve it for result)
+            after_stripped = suggestion_after.lstrip()
+            for overlap_len in range(min(len(new_changed), len(after_stripped)), 0, -1):
+                if new_changed[-overlap_len:] == after_stripped[:overlap_len]:
+                    # Remove overlapping portion from after (keeping the original leading space)
+                    suggestion_after = suggestion_after[:len(suggestion_after) - len(after_stripped)] + after_stripped[overlap_len:]
+                    break
+        
+        suggestion_formatted = before + new_text[:new_start] + f"**{new_changed}**" + new_text_remainder + suggestion_after
+        # Normalize spaces
+        suggestion_formatted = _normalize_spaces(suggestion_formatted)
     
     return at_formatted.strip(), suggestion_formatted.strip()
 
@@ -648,21 +726,22 @@ def format_deletion(context: str, deleted_text: str) -> tuple[str, str]:
     original_deleted_text = deleted_text
     deleted_text = deleted_text.strip()
     
-    # Handle whitespace-only deletions (e.g., space removal)
+    # Handle whitespace-only deletions (e.g., space removal) - skip as not meaningful
     if not deleted_text and original_deleted_text and original_deleted_text.strip() == "":
-        return "*(space removed)*" if original_deleted_text == " " else "*(whitespace removed)*", "*(deleted)*"
+        return "", ""
     
     if not context or not deleted_text:
-        return f"**{deleted_text}**" if deleted_text else "", "*(deleted)*"
+        return f"**{deleted_text}**" if deleted_text else "", "*(deleted)*" if deleted_text else ""
     
     if deleted_text in context:
         at_formatted = context.replace(deleted_text, f"**{deleted_text}**", 1)
-        suggestion_formatted = context.replace(deleted_text, "*(deleted)*", 1)
+        # For suggestion, just remove the deleted text (no marker needed)
+        suggestion_formatted = context.replace(deleted_text, "", 1).strip()
     else:
         at_formatted = f"**{deleted_text}**"
         suggestion_formatted = "*(deleted)*"
     
-    return at_formatted.strip(), suggestion_formatted.strip()
+    return at_formatted.strip(), suggestion_formatted
 
 
 def format_comment(context: str, target: str, comment_text: str) -> tuple[str, str]:
@@ -673,19 +752,31 @@ def format_comment(context: str, target: str, comment_text: str) -> tuple[str, s
         (at_formatted, suggestion_formatted) where:
         - at_formatted: context with target text in bold
         - suggestion_formatted: the comment text (no bold)
+    
+    Returns empty strings if the comment should be skipped (e.g., internal
+    processing notes like conflict downgrades, or empty targets).
     """
     context = context.strip()
     target = target.strip()
+    comment_text = comment_text.strip()
+    
+    # Skip internal conflict downgrade messages - these are processing artifacts
+    if comment_text.startswith("Conflict downgrade"):
+        return "", ""
+    
+    # Skip comments with empty/whitespace-only content that would produce empty columns
+    if not context and not target:
+        return "", ""
     
     if not context:
-        return f"**{target}**" if target else "", comment_text.strip()
+        return f"**{target}**" if target else "", comment_text
     
     if target and target in context:
         at_formatted = context.replace(target, f"**{target}**", 1)
     else:
         at_formatted = context
     
-    return at_formatted.strip(), comment_text.strip()
+    return at_formatted.strip(), comment_text
 
 
 def _stable_location_string(location: dict[str, Any]) -> str:
@@ -719,7 +810,10 @@ def _group_changes_by_section(changes: list[dict[str, Any]]) -> dict[str, list[d
     for change in changes:
         location = change.get("location", {})
         heading_path = location.get("heading_path", [])
-        section = str(heading_path[-1]) if heading_path else "(no heading)"
+        # Use empty string for front matter (no heading) instead of placeholder
+        raw_section = str(heading_path[-1]) if heading_path else ""
+        # Strip trailing punctuation from section names for cleaner headers (Issue #36)
+        section = raw_section.rstrip(".:;,- ").strip()
         sections[section].append(change)
     return sections
 
@@ -739,16 +833,25 @@ def _escape_table_cell(text: str) -> str:
     return text.replace("|", "\\|")
 
 
-def _render_changes_table(changes: list[dict[str, Any]], lines: list[str]) -> None:
-    """Render a table of changes."""
+def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start_index: int = 1) -> int:
+    """Render a table of changes.
+    
+    Args:
+        changes: List of change dictionaries
+        lines: List to append markdown lines to
+        start_index: Starting number for the first entry (default 1)
+        
+    Returns:
+        The next index number after all entries (for continuing numbering across sections)
+    """
     if not changes:
-        return
+        return start_index
     
     lines.append("| # | At | Suggestion |")
     lines.append("|---|----|------------|")
     
+    current_index = start_index
     for change in changes:
-        op_index = _to_int(change.get("op_index"), 0)
         before = str(change.get("before_snippet", ""))  # Extended context with surrounding words
         exact_snippet = str(change.get("exact_snippet", ""))  # Exact text targeted (the old text)
         after = str(change.get("after_snippet", ""))
@@ -763,24 +866,30 @@ def _render_changes_table(changes: list[dict[str, Any]], lines: list[str]) -> No
             at_snippet, suggestion = format_deletion(before, exact_snippet)
         elif op_type == "insert_at":
             at_snippet = before
-            suggestion = f"**{after}**" if after else "*(deleted)*"
+            suggestion = f"**{after}**" if after else ""
         elif op_type == "add_comment":
             at_snippet, suggestion = format_comment(before, exact_snippet, str(annotation) if annotation else "")
         else:
             at_snippet = before
             suggestion = after
         
-        # Add uncertainty flag if needed
-        if uncertain:
-            at_snippet += " *(approx)*"
+        # Skip entries that result in empty display (e.g., filtered conflict messages,
+        # whitespace-only changes, or empty comments)
+        if not at_snippet.strip() and not suggestion.strip():
+            continue
+        
+        # Note: uncertainty flag is tracked in metadata but not displayed in markdown
+        # to keep the output clean and professional
         
         # Escape pipe characters
         at_column = _escape_table_cell(at_snippet)
         suggestion = _escape_table_cell(suggestion)
         
-        lines.append(f"| {op_index} | {at_column} | {suggestion} |")
+        lines.append(f"| {current_index} | {at_column} | {suggestion} |")
+        current_index += 1
     
     lines.append("")
+    return current_index
 
 
 def render_changes_markdown(payload: dict[str, Any]) -> str:
@@ -817,6 +926,9 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
         "",
     ]
     
+    # Use sequential numbering across all sections (Issue #23)
+    next_index = 1
+    
     # Section 1: Text Changes (replacements, deletions, insertions)
     if edits:
         lines.append("## Text Changes")
@@ -824,9 +936,11 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
         
         edit_sections = _group_changes_by_section(edits)
         for section_name, section_changes in edit_sections.items():
-            lines.append(f"### {section_name}")
-            lines.append("")
-            _render_changes_table(section_changes, lines)
+            # Skip empty section headers for front matter (no heading)
+            if section_name:
+                lines.append(f"### {section_name}")
+                lines.append("")
+            next_index = _render_changes_table(section_changes, lines, next_index)
     
     # Section 2: Comments
     if comments:
@@ -835,9 +949,11 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
         
         comment_sections = _group_changes_by_section(comments)
         for section_name, section_changes in comment_sections.items():
-            lines.append(f"### {section_name}")
-            lines.append("")
-            _render_changes_table(section_changes, lines)
+            # Skip empty section headers for front matter (no heading) - Issue #30
+            if section_name:
+                lines.append(f"### {section_name}")
+                lines.append("")
+            next_index = _render_changes_table(section_changes, lines, next_index)
     
     # Section 3: Others (if any)
     if others:
@@ -846,9 +962,11 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
         
         other_sections = _group_changes_by_section(others)
         for section_name, section_changes in other_sections.items():
-            lines.append(f"### {section_name}")
-            lines.append("")
-            _render_changes_table(section_changes, lines)
+            # Skip empty section headers for front matter (no heading)
+            if section_name:
+                lines.append(f"### {section_name}")
+                lines.append("")
+            next_index = _render_changes_table(section_changes, lines, next_index)
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -917,6 +1035,17 @@ def build_change_report_payload(
             if before_no_ws == after_no_ws:
                 continue
         
+        # Skip comments with internal processing artifacts (conflict downgrades)
+        # These are not meaningful user-facing suggestions
+        if op_type == "add_comment":
+            comment_text = _comment_text_from_op(op)
+            if comment_text.startswith("Conflict downgrade"):
+                continue
+            # Skip comments with empty/whitespace-only target text
+            # These produce empty "At" columns and aren't actionable
+            if not before.strip():
+                continue
+        
         accepted_text = str(unit.get("accepted_text", "")) if unit else ""
         disambiguation = _disambiguation(
             before_snippet=before,
@@ -947,7 +1076,11 @@ def build_change_report_payload(
                 while context_end < len(accepted_text) and not accepted_text[context_end].isspace():
                     context_end += 1
                 
-                extended_before = accepted_text[context_start:context_end]
+                candidate_extended = accepted_text[context_start:context_end]
+                # Validate: the extended context must contain the exact snippet as a word
+                # This prevents cases where the snippet is inside another word (e.g., "les" in "l'ensemble")
+                if _find_with_word_boundary(candidate_extended, before) >= 0:
+                    extended_before = candidate_extended
 
         change: dict[str, Any] = {
             "op_index": op_index,
