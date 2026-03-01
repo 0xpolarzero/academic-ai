@@ -15,7 +15,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["type", "target", "expected", "range", "replacement", "new_text", "comment_text"],
+        "required": ["type", "target", "expected", "quoted_text", "replacement", "new_text", "comment_text"],
         "properties": {
           "type": {
             "type": "string",
@@ -31,19 +31,15 @@
               "unit_uid": { "type": "string", "minLength": 1 }
             }
           },
-          "range": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["start", "end"],
-            "properties": {
-              "start": { "type": "integer", "minimum": 0 },
-              "end": { "type": "integer", "minimum": 0 }
-            }
+          "quoted_text": {
+            "type": "string",
+            "minLength": 20,
+            "maxLength": 150,
+            "description": "Quote 40-100 total chars with exact target wrapped in [[double brackets]]. Brackets indicate precise span; surrounding context ensures unique matching. Total length must be 40-100 characters."
           },
           "expected": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["snippet"],
             "properties": {
               "snippet": { "type": "string" }
             }

@@ -94,13 +94,7 @@ def main() -> int:
     print(f"Apply log: {apply_log_path}")
     print(f"Wrote: {result['output_md']}")
     print(f"Wrote: {result['output_json']}")
-    print(
-        "Ops: "
-        f"total={stats['op_count']} "
-        f"applied={stats['applied']} "
-        f"skipped={stats['skipped']} "
-        f"unknown={stats['unknown']}"
-    )
+    print(f"Ops: total={stats['op_count']}")
 
     return 0
 

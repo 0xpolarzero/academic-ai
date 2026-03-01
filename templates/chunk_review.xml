@@ -9,13 +9,22 @@
   <rules>
     <rule>Return valid JSON only, matching the provided output schema.</rule>
     <rule>Target only primary_units from the chunk payload.</rule>
-    <rule>All edit/comment ops must include expected.snippet.</rule>
-    <rule>Include range for every op. Use conservative ranges only when confident.</rule>
-    <rule>For each op object, always include all three fields: replacement, new_text, comment_text.</rule>
-    <rule>For unused fields set empty string "".</rule>
-    <rule>If type=replace_range: replacement is the text to insert. Set to empty string "" to delete the range.</rule>
-    <rule>If type=insert_at, new_text must be non-empty; range.start must equal range.end.</rule>
-    <rule>If type=add_comment, comment_text must be non-empty reviewer comment.</rule>
-    <rule>To delete text: use type=replace_range with replacement="" (empty string).</rule>
+    <rule>For each op, provide quoted_text (40-100 chars total) with [[target]] markers instead of character positions.</rule>
+    <rule>Wrap the SPECIFIC TARGET SPAN in DOUBLE BRACKETS: [[exact words here]]</rule>
+    <rule>Include 15-40 characters of context BEFORE the [[target]] and 15-40 characters AFTER.</rule>
+    <rule>Total quoted_text length must be 40-100 characters including the brackets.</rule>
+    <rule>Example GOOD: "transformations dans les [[workscapes]] en viennent peu" (64 chars)</rule>
+    <rule>Example BAD (too short): "les [[workscapes]] en" (23 chars - not enough context)</rule>
+    <rule>Example BAD (no brackets): "transformations dans les workscapes en viennent"</rule>
+    <rule>Context proves WHICH occurrence you mean; brackets show EXACTLY which words to target.</rule>
+    <rule>If target appears multiple times, use MORE context to disambiguate.</rule>
+    <rule>For type=replace_range: replacement field is what replaces the [[target]] content.</rule>
+    <rule>For type=insert_at: Use [[ ]] (space between brackets) at insertion point: "before [[ ]]after"</rule>
+    <rule>For type=add_comment: Brackets indicate which span receives the comment.</rule>
+    <rule>The [[ and ]] are positioning markers ONLY—never include them in your replacement or thinking.</rule>
+    <rule>Do NOT use markdown, code blocks, or extra formatting in quoted_text.</rule>
+    <rule>If target is at start: "[[Target]] at beginning with context after"</rule>
+    <rule>If target is at end: "Context before ending with [[target]]"</rule>
+    <rule>For unused fields (replacement, new_text, comment_text depending on op type), set empty string "".</rule>
   </rules>
 </chunk_review_prompt>

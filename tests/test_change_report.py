@@ -213,6 +213,7 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
 
     assert payload["schema_version"] == "change_report.v1"
     assert payload["stats"]["op_count"] == 2
+    # Stats now only include op_count (removed applied/skipped/unknown)
 
     first_change = payload["changes"][0]
     assert first_change["location"]["heading_path"] == ["Section 1"]
@@ -222,24 +223,28 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
     assert "word/document.xml" in first_change["stable_location"]
     assert "para_1" in first_change["stable_location"]
     assert "unit_1" in first_change["stable_location"]
-    assert first_change["before_snippet"] == "beta"
+    # before_snippet now includes more context for Ctrl+F (up to ~60 chars)
+    assert "beta" in first_change["before_snippet"]
     assert first_change["after_snippet"] == "BETA"
-    assert first_change["apply"] == {"status": "applied", "reason": None}
+    # location_uncertain is False since there's no disambiguation
+    assert first_change.get("location_uncertain") is False
 
     second_change = payload["changes"][1]
-    assert second_change["before_snippet"] == "Alpha"
+    assert "Alpha" in second_change["before_snippet"]
     assert second_change["after_snippet"] == "Clarify intro."
     assert second_change["annotation"] == "Clarify intro."
-    assert second_change["apply"] == {
-        "status": "skipped",
-        "reason": "target_not_found",
-    }
+    assert second_change.get("location_uncertain") is False
 
-    assert "Op 0: replace_range" in markdown
-    assert "Op 1: add_comment" in markdown
+    # Markdown now uses Review format with tables
+    assert "# Review" in markdown
+    assert "2 suggestions" in markdown
     assert "Section 1" in markdown
-    assert "before:" in markdown
-    assert "after:" in markdown
+    assert "| # | At | Suggestion |" in markdown
+    # Context in both columns, old text bold in At, new text bold in Suggestion
+    assert "**beta**" in markdown  # Old text bold
+    assert "**BETA**" in markdown  # New text bold
+    # Comment text in table
+    assert "Clarify intro." in markdown
 
 
 def test_change_report_includes_disambiguation_for_repeated_before_snippet(tmp_path: Path) -> None:

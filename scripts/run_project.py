@@ -17,6 +17,8 @@ import select
 import subprocess
 import sys
 import time
+import unicodedata
+from difflib import SequenceMatcher
 import xml.etree.ElementTree as ET
 from typing import Any
 from typing import TextIO
@@ -54,7 +56,7 @@ def _load_schema_content(schema_path: Path) -> str:
 
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]{3,}")
 VALID_OP_TYPES = {"add_comment", "replace_range", "insert_at"}
-EDIT_OP_TYPES = {"replace_range", "insert_at", "delete_range"}
+EDIT_OP_TYPES = {"replace_range", "insert_at"}
 
 ANSI_RESET = "\033[0m"
 ANSI_DIM = "\033[2m"
@@ -809,6 +811,163 @@ def _validate_against_schema(data: Any, schema: dict, path: str = "root") -> lis
     return errors
 
 
+@dataclass
+class MatchResult:
+    start: int  # UTF-16 code unit offset
+    end: int    # UTF-16 code unit offset
+    score: float
+
+
+def _derive_range_from_quoted_text(
+    quoted_text: str, 
+    unit_text: str, 
+    op_index: int,
+    chunk_id: str = ""
+) -> tuple[int, int]:
+    """
+    Derive UTF-16 character range from quoted text with inline markers.
+    
+    Args:
+        quoted_text: Text with [[target]] markers
+        unit_text: Full text of the target unit (Unicode string)
+        op_index: Index for error reporting
+        chunk_id: Chunk ID for error reporting
+        
+    Returns:
+        (start, end) UTF-16 code unit positions (not Python string indices)
+        
+    Raises:
+        RuntimeError: If quoted_text is invalid or cannot be found
+    """
+    # Validate brackets exist and are properly paired
+    if quoted_text.count("[[") != 1 or quoted_text.count("]]") != 1:
+        raise RuntimeError(
+            f"Chunk {chunk_id} op {op_index}: quoted_text must contain exactly one [[ and one ]]. "
+            f"Got: {quoted_text[:50]}..."
+        )
+    
+    # Use regex to extract components (handles nested brackets gracefully)
+    # Pattern: everything up to [[, then target, then everything after ]]
+    match = re.match(r'^(.*?)\[\[(.*?)\]\](.*)$', quoted_text, re.DOTALL)
+    if not match:
+        raise RuntimeError(
+            f"Chunk {chunk_id} op {op_index}: Cannot parse [[markers]] in quoted_text. "
+            f"Got: {quoted_text[:50]}..."
+        )
+    
+    pre, target, post = match.groups()
+    
+    # Handle insert-at case: collapsed markers [[ ]] or [[]]
+    is_insert_at = target.strip() == ""
+    
+    # Build search text (quote without brackets)
+    # Normalize Unicode to NFC for matching
+    search_text = unicodedata.normalize('NFC', pre + target + post)
+    unit_text_nfc = unicodedata.normalize('NFC', unit_text)
+    
+    # Fuzzy find
+    match_result = _fuzzy_find(search_text, unit_text_nfc, threshold=0.80)
+    if not match_result:
+        # Try with whitespace normalized
+        search_normalized = re.sub(r'\s+', ' ', search_text).strip()
+        unit_normalized = re.sub(r'\s+', ' ', unit_text_nfc)
+        match_result = _fuzzy_find(search_normalized, unit_normalized, threshold=0.85)
+        
+    if not match_result:
+        raise RuntimeError(
+            f"Chunk {chunk_id} op {op_index}: Cannot find quoted_text in unit.\n"
+            f"  Quoted: {quoted_text[:80]}...\n"
+            f"  Target: {target[:40] if target else '(insert)'}")
+    
+    # Calculate positions in Unicode codepoints first
+    match_start_cp = match_result.start
+    
+    # Adjust for pre-context to get actual target start
+    # Normalize pre the same way we normalized search_text
+    pre_normalized = unicodedata.normalize('NFC', pre)
+    if pre_normalized:
+        # Find pre_normalized within the matched text
+        # Since we fuzzy-matched, we need to find where pre ends in the match
+        matched_text = unit_text_nfc[match_start_cp:match_start_cp + len(search_text)]
+        # Find where target starts within the matched text
+        target_idx_in_match = matched_text.find(target) if target else len(pre_normalized)
+        if target_idx_in_match < 0:
+            target_idx_in_match = len(pre_normalized)  # Fallback
+    else:
+        target_idx_in_match = 0
+    
+    target_start_cp = match_start_cp + target_idx_in_match
+    target_end_cp = target_start_cp + len(target) if target else target_start_cp
+    
+    # Convert to UTF-16 code units for DOCX compatibility
+    text_before_start = unit_text_nfc[:target_start_cp]
+    text_before_end = unit_text_nfc[:target_end_cp]
+    
+    start_utf16 = len(text_before_start.encode('utf-16-le')) // 2
+    end_utf16 = len(text_before_end.encode('utf-16-le')) // 2
+    
+    return start_utf16, end_utf16
+
+
+def _fuzzy_find(needle: str, haystack: str, threshold: float = 0.85) -> MatchResult | None:
+    """
+    Find needle in haystack with fuzzy matching.
+    
+    Uses SequenceMatcher for similarity. Optimized with early-exit for exact matches.
+    Returns MatchResult with UTF-16 positions, or None if no match above threshold.
+    """
+    # Early exit: exact match
+    idx = haystack.find(needle)
+    if idx >= 0:
+        # Calculate UTF-16 position
+        text_before = haystack[:idx]
+        start_utf16 = len(text_before.encode('utf-16-le')) // 2
+        end_utf16 = start_utf16 + len(needle.encode('utf-16-le')) // 2
+        return MatchResult(start=start_utf16, end=end_utf16, score=1.0)
+    
+    # For short needles, sliding window is fast enough
+    # For long needles, use larger step or Boyer-Moore pre-filter
+    needle_len = len(needle)
+    haystack_len = len(haystack)
+    
+    if needle_len > haystack_len:
+        return None
+    
+    # Optimization: if needle is long (>200 chars), check fewer windows
+    step = 1 if needle_len < 100 else 5
+    
+    best_score = 0.0
+    best_start = -1
+    
+    for i in range(0, haystack_len - needle_len + 1, step):
+        window = haystack[i:i + needle_len]
+        score = SequenceMatcher(None, needle, window).ratio()
+        if score > best_score:
+            best_score = score
+            best_start = i
+            if score == 1.0:  # Exact match found
+                break
+    
+    if best_score >= threshold:
+        # Fine-tune around best match (in case we skipped with step > 1)
+        if step > 1:
+            start_fine = max(0, best_start - step)
+            end_fine = min(haystack_len - needle_len + 1, best_start + step + 1)
+            for i in range(start_fine, end_fine):
+                window = haystack[i:i + needle_len]
+                score = SequenceMatcher(None, needle, window).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_start = i
+        
+        text_before = haystack[:best_start]
+        start_utf16 = len(text_before.encode('utf-16-le')) // 2
+        end_utf16 = start_utf16 + len(needle.encode('utf-16-le')) // 2
+        return MatchResult(start=start_utf16, end=end_utf16, score=best_score)
+    
+    return None
+
+
 def _render_template(path: Path, replacements: dict[str, str]) -> str:
     text = path.read_text(encoding="utf-8")
     for key, value in replacements.items():
@@ -1172,6 +1331,52 @@ def _ranges_overlap(left_start: int, left_end: int, right_start: int, right_end:
     return max(left_start, right_start) < min(left_end, right_end)
 
 
+def _build_quoted_text(text: str, target_start: int, target_end: int, min_context: int = 15, max_context: int = 40) -> str:
+    """Build quoted_text with [[target]] markers from character positions.
+    
+    Args:
+        text: The full unit text
+        target_start: Start position in the text (Python string index)
+        target_end: End position in the text (Python string index)
+        min_context: Minimum context chars before and after target
+        max_context: Maximum context chars before and after target
+    
+    Returns:
+        quoted_text with [[target]] markers
+    """
+    # Get target text
+    target = text[target_start:target_end]
+    
+    # Calculate context bounds
+    context_before_start = max(0, target_start - max_context)
+    context_before_end = max(0, target_start - min_context)
+    context_after_start = min(len(text), target_end + min_context)
+    context_after_end = min(len(text), target_end + max_context)
+    
+    # Get context with at least min_context chars if available
+    if context_before_end > context_before_start:
+        before = text[context_before_end:target_start]
+    else:
+        # Try to get more context if available
+        before = text[context_before_start:target_start]
+    
+    if context_after_end > context_after_start:
+        after = text[target_end:context_after_start]
+    else:
+        # Try to get more context if available
+        after = text[target_end:context_after_end]
+    
+    # Handle edge cases at start/end
+    if target_start == 0:
+        quoted = f"[[{target}]]{after}"
+    elif target_end >= len(text):
+        quoted = f"{before}[[{target}]]"
+    else:
+        quoted = f"{before}[[{target}]]{after}"
+    
+    return quoted
+
+
 def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
     accepted_text = str(unit.get("accepted_text", ""))
     part = str(unit.get("part", "")).strip()
@@ -1190,24 +1395,36 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
     if len(unique_matches) < 4:
         return None
 
-    offsets = _utf16_offsets(accepted_text)
-
     for indices in itertools.combinations(range(len(unique_matches)), 4):
         comment_match = unique_matches[indices[0]]
         replace_match = unique_matches[indices[1]]
         insert_match = unique_matches[indices[2]]
         delete_match = unique_matches[indices[3]]
 
-        comment_span = (offsets[comment_match.start()], offsets[comment_match.end()])
-        replace_span = (offsets[replace_match.start()], offsets[replace_match.end()])
-        delete_span = (offsets[delete_match.start()], offsets[delete_match.end()])
-        insert_pos = offsets[insert_match.end()]
+        # Get Python string positions
+        comment_start, comment_end = comment_match.start(), comment_match.end()
+        replace_start, replace_end = replace_match.start(), replace_match.end()
+        delete_start, delete_end = delete_match.start(), delete_match.end()
+        insert_pos = insert_match.end()
 
-        if _ranges_overlap(replace_span[0], replace_span[1], delete_span[0], delete_span[1]):
+        # Build quoted_text for each operation
+        replace_quoted = _build_quoted_text(accepted_text, replace_start, replace_end)
+        delete_quoted = _build_quoted_text(accepted_text, delete_start, delete_end)
+        comment_quoted = _build_quoted_text(accepted_text, comment_start, comment_end)
+        
+        # For insert_at: use [[ ]] at insertion point
+        insert_before = max(0, insert_pos - 20)
+        insert_after = min(len(accepted_text), insert_pos + 20)
+        before_text = accepted_text[insert_before:insert_pos]
+        after_text = accepted_text[insert_pos:insert_after]
+        insert_quoted = f"{before_text}[[ ]]{after_text}"
+
+        # Check for overlaps in Python positions (not UTF-16 for dry-run check)
+        if _ranges_overlap(replace_start, replace_end, delete_start, delete_end):
             continue
-        if _ranges_overlap(insert_pos, insert_pos, replace_span[0], replace_span[1]):
+        if _ranges_overlap(insert_pos, insert_pos, replace_start, replace_end):
             continue
-        if _ranges_overlap(insert_pos, insert_pos, delete_span[0], delete_span[1]):
+        if _ranges_overlap(insert_pos, insert_pos, delete_start, delete_end):
             continue
 
         target = {
@@ -1225,7 +1442,7 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
             {
                 "type": "replace_range",
                 "target": target,
-                "range": {"start": replace_span[0], "end": replace_span[1]},
+                "quoted_text": replace_quoted,
                 "expected": {"snippet": replace_before},
                 "replacement": replacement,
                 "new_text": "",
@@ -1234,7 +1451,7 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
             {
                 "type": "insert_at",
                 "target": target,
-                "range": {"start": insert_pos, "end": insert_pos},
+                "quoted_text": insert_quoted,
                 "expected": {"snippet": ""},
                 "new_text": " [DRY-RUN]",
                 "replacement": "",
@@ -1243,7 +1460,7 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
             {
                 "type": "replace_range",
                 "target": target,
-                "range": {"start": delete_span[0], "end": delete_span[1]},
+                "quoted_text": delete_quoted,
                 "expected": {"snippet": delete_match.group(0)},
                 "replacement": "",
                 "new_text": "",
@@ -1252,7 +1469,7 @@ def _build_ops_for_unit(unit: dict[str, Any]) -> list[dict[str, Any]] | None:
             {
                 "type": "add_comment",
                 "target": target,
-                "range": {"start": comment_span[0], "end": comment_span[1]},
+                "quoted_text": comment_quoted,
                 "expected": {"snippet": comment_match.group(0)},
                 "comment_text": "Dry-run QA marker comment.",
                 "replacement": "",
@@ -1371,14 +1588,17 @@ def _sanitize_chunk_result_ops(
 
     sanitized_ops: list[dict[str, Any]] = []
     kept = 0
+    conversions: list[dict[str, Any]] = []
 
     for idx, raw_op in enumerate(raw_ops):
         if not isinstance(raw_op, dict):
-            raise RuntimeError(f"Operation at index {idx} is not a dict: {type(raw_op)}")
+            conversions.append({"index": idx, "reason": "not_a_dict", "raw_type": str(type(raw_op))})
+            continue
 
         op_type = str(raw_op.get("type", "")).strip()
         if op_type not in VALID_OP_TYPES:
-            raise RuntimeError(f"Invalid op type '{op_type}' at index {idx}. Valid types: {VALID_OP_TYPES}")
+            conversions.append({"index": idx, "reason": "invalid_type", "type": op_type})
+            continue
 
         # ALWAYS resolve target using unit_uid from the AI's output
         # but use the chunk's ground truth for part/para_id/unit_uid
@@ -1390,7 +1610,8 @@ def _sanitize_chunk_result_ops(
                 key = unit_uid_to_target[unit_uid]  # Use chunk's ground truth
 
         if key is None:
-            raise RuntimeError(f"Operation at index {idx} targets non-primary unit: {target}")
+            conversions.append({"index": idx, "reason": "non_primary_target", "target": target})
+            continue
 
         normalized_target = {"part": key[0], "para_id": key[1], "unit_uid": key[2]}
         expected = raw_op.get("expected")
@@ -1398,37 +1619,66 @@ def _sanitize_chunk_result_ops(
         if isinstance(expected, dict):
             snippet = str(expected.get("snippet", ""))
 
-        normalized_range = _normalize_range(raw_op.get("range"))
-        if normalized_range is None and op_type == "add_comment":
-            normalized_range = {"start": 0, "end": 0}
+        # Get unit text from primary_units for range derivation
+        unit_text = ""
+        for unit in primary_units:
+            if isinstance(unit, dict) and str(unit.get("unit_uid", "")).strip() == key[2]:
+                unit_text = str(unit.get("accepted_text", ""))
+                break
+        
+        # Derive range from quoted_text instead of using LLM-provided range
+        quoted_text = raw_op.get("quoted_text", "")
+        normalized_range = None
+        
+        if quoted_text:
+            try:
+                start_utf16, end_utf16 = _derive_range_from_quoted_text(
+                    quoted_text, unit_text, idx, chunk_id
+                )
+                normalized_range = {"start": start_utf16, "end": end_utf16}
+            except RuntimeError as e:
+                # Fall back to provided range if derivation fails
+                pass
+        
+        # Fallback to provided range if quoted_text derivation failed or was missing
+        if normalized_range is None:
+            normalized_range = _normalize_range(raw_op.get("range"))
+        
+        if normalized_range is None:
+            conversions.append({"index": idx, "reason": "missing_range", "type": op_type})
+            continue
 
         sanitized: dict[str, Any] = {
             "type": op_type,
             "target": normalized_target,
             "expected": {"snippet": snippet},
+            "range": normalized_range,
         }
-        if normalized_range is not None:
-            sanitized["range"] = normalized_range
 
         if op_type == "replace_range":
             if "replacement" not in raw_op:
-                raise RuntimeError(f"replace_range op missing 'replacement' field at index {idx}")
+                conversions.append({"index": idx, "reason": "missing_replacement", "target": normalized_target})
+                continue
             replacement = str(raw_op.get("replacement", ""))
             # Empty replacement is valid - means delete the range
             sanitized["replacement"] = replacement
         elif op_type == "insert_at":
-            if normalized_range is not None and normalized_range["start"] != normalized_range["end"]:
-                raise RuntimeError(f"insert_at op at index {idx} has non-collapsed range: {normalized_range}")
+            if normalized_range["start"] != normalized_range["end"]:
+                conversions.append({"index": idx, "reason": "non_collapsed_range", "range": normalized_range})
+                continue
             if "new_text" not in raw_op:
-                raise RuntimeError(f"insert_at op at index {idx} missing 'new_text' field")
+                conversions.append({"index": idx, "reason": "missing_new_text", "target": normalized_target})
+                continue
             new_text = str(raw_op.get("new_text", ""))
             if new_text == "":
-                raise RuntimeError(f"insert_at op at index {idx} has empty 'new_text'")
+                conversions.append({"index": idx, "reason": "empty_new_text", "target": normalized_target})
+                continue
             sanitized["new_text"] = new_text
         elif op_type == "add_comment":
             comment_text = str(raw_op.get("comment_text", "")).strip()
             if not comment_text:
-                raise RuntimeError(f"add_comment op missing 'comment_text' at index {idx}")
+                conversions.append({"index": idx, "reason": "missing_comment_text", "target": normalized_target})
+                continue
             sanitized["comment_text"] = comment_text
 
         sanitized_ops.append(sanitized)
@@ -1452,6 +1702,8 @@ def _sanitize_chunk_result_ops(
         "input_op_count": len(raw_ops),
         "output_op_count": len(sanitized_ops),
         "kept_ops": kept,
+        "converted_ops": len(conversions),
+        "conversions": conversions,
     }
     return sanitized_payload, log_payload
 

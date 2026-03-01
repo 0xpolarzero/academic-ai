@@ -923,11 +923,15 @@ def apply_patch_to_output(
 
             actual_snippet = paragraph_text[start_cp:end_cp]
             expected_snippet = str(normalized["expected"].get("snippet", ""))
-            if actual_snippet != expected_snippet:
-                entry["status"] = "skipped"
-                entry["reason"] = "snippet_mismatch"
-                entry["actual_snippet"] = actual_snippet
-                continue
+            snippet_matched = actual_snippet == expected_snippet
+            if not snippet_matched:
+                # For add_comment ops, we still apply but mark as location_uncertain
+                # For edit ops, we skip on mismatch
+                if op_type != "add_comment":
+                    entry["status"] = "skipped"
+                    entry["reason"] = "snippet_mismatch"
+                    entry["actual_snippet"] = actual_snippet
+                    continue
 
             if op_type == "insert_at" and start_cp != end_cp:
                 entry["status"] = "skipped"
@@ -990,6 +994,11 @@ def apply_patch_to_output(
                     entry["reason"] = "missing_comment_text"
                     continue
 
+                # If snippet didn't match, prepend warning flag and mark location_uncertain
+                location_uncertain = not snippet_matched
+                if location_uncertain:
+                    comment_text = f"⚠️ [Location uncertain] {comment_text}"
+
                 comment_event = CommentEvent(
                     start_cp=start_cp,
                     end_cp=end_cp,
@@ -1010,6 +1019,10 @@ def apply_patch_to_output(
                 )
                 parts_with_comments.add(locator.part)
                 entry["comment_id"] = comment_event.comment_id
+                entry["location_uncertain"] = location_uncertain
+                # Also record actual_snippet for debugging purposes
+                if not snippet_matched:
+                    entry["actual_snippet"] = actual_snippet
 
             entry["status"] = "applied"
             entry["reason"] = None
