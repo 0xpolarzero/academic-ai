@@ -15,7 +15,7 @@ MERGE_SCRIPT := .codex/skills/docx_merge_dedup_validate_patch/scripts/merge_patc
 APPLY_SCRIPT := .codex/skills/docx_apply_patch_to_output/scripts/apply_docx_patch.py
 REPORT_SCRIPT := .codex/skills/docx_change_report_before_after/scripts/change_report.py
 
-.PHONY: help fixtures extract chunk merge apply report test e2e clean project run
+.PHONY: help fixtures extract chunk merge apply report test e2e clean project run resume
 
 help:
 	@echo "Pipeline targets"
@@ -24,9 +24,11 @@ help:
 	@echo "  make chunk     # extraction -> artifacts/chunks"
 	@echo "  make merge     # synthetic chunk_results -> artifacts/patch"
 	@echo "  make apply     # patch -> output/annotated.docx + artifacts/apply"
-	@echo "  make report    # patch/apply -> output/changes.{md,json}"
+	@echo "  make report    # patch/apply -> output/changes.{md,json,docx}"
 	@echo "  make project PROJECT=<slug>                 # scaffold projects/<slug> layout"
 	@echo "  make run PROJECT=<slug> WORKFLOW=<name> [INPUT=<file.docx>] [DRY_RUN=1] [RALPH=N] [SKIP_JUDGE=1] [CLI=codex|kimi|claude] [MODEL=<model>]  # run project workflow"
+	@echo "  make resume PROJECT=<slug> WORKFLOW=<name> FROM=<step> [INPUT=<file.docx>] [RALPH=N] [CLI=codex|kimi|claude] [MODEL=<model>]  # resume from step: judge|merge|apply|report"
+	@echo "  make resume PROJECT=<slug> WORKFLOW=<name> FROM_RALPH=N [INPUT=<file.docx>] [RALPH=N] [CLI=codex|kimi|claude] [MODEL=<model>]  # resume from Ralph run N"
 	@echo "  make test      # pytest unit + integration checks"
 	@echo "  make e2e       # offline thesis dry-run + acceptance checks"
 
@@ -79,6 +81,45 @@ run:
 		INPUT_FLAG="--input $(INPUT)"; \
 	fi; \
 	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$INPUT_FLAG $$DRY_FLAG $$RALPH_FLAG $$SKIP_JUDGE_FLAG $$CLI_FLAG $$MODEL_FLAG
+
+resume:
+	@test -n "$(PROJECT)" || (echo "Usage: make resume PROJECT=<slug> WORKFLOW=<name> FROM=<step>|FROM_RALPH=N [INPUT=<file.docx>]" && exit 2)
+	@test -n "$(WORKFLOW)" || (echo "Usage: make resume PROJECT=<slug> WORKFLOW=<name> FROM=<step>|FROM_RALPH=N [INPUT=<file.docx>]" && exit 2)
+	@test -n "$(FROM)$(FROM_RALPH)" || (echo "Usage: make resume PROJECT=<slug> WORKFLOW=<name> FROM=<step>|FROM_RALPH=N [INPUT=<file.docx>]" && exit 2)
+	@if [ -n "$(FROM)" ] && [ -n "$(FROM_RALPH)" ]; then \
+		echo "Error: specify only one of FROM=<step> or FROM_RALPH=N"; \
+		exit 2; \
+	fi
+	@test -d "projects/$(PROJECT)" || (echo "Missing project directory: projects/$(PROJECT)" && exit 2)
+	@test -f "projects/$(PROJECT)/workflows/$(WORKFLOW).xml" || (echo "Missing workflow file: projects/$(PROJECT)/workflows/$(WORKFLOW).xml" && exit 2)
+	@test -f "scripts/run_project.py" || (echo "Missing runner: scripts/run_project.py" && exit 2)
+	@mkdir -p "projects/$(PROJECT)/input"
+	@if [ "$(INPUT)" != "" ] && [ ! -f "projects/$(PROJECT)/input/$(INPUT)" ]; then \
+		echo "Error: Specified input file not found: projects/$(PROJECT)/input/$(INPUT)"; \
+		exit 2; \
+	fi
+	@RALPH_FLAG="--ralph $(RALPH)"; \
+	CLI_FLAG=""; \
+	if [ -n "$(CLI)" ]; then \
+		CLI_FLAG="--cli $(CLI)"; \
+	fi; \
+	MODEL_FLAG=""; \
+	if [ -n "$(MODEL)" ]; then \
+		MODEL_FLAG="--model $(MODEL)"; \
+	fi; \
+	INPUT_FLAG=""; \
+	if [ -n "$(INPUT)" ]; then \
+		INPUT_FLAG="--input $(INPUT)"; \
+	fi; \
+	FROM_STEP_FLAG=""; \
+	if [ -n "$(FROM)" ]; then \
+		FROM_STEP_FLAG="--from-step $(FROM)"; \
+	fi; \
+	FROM_RALPH_FLAG=""; \
+	if [ -n "$(FROM_RALPH)" ]; then \
+		FROM_RALPH_FLAG="--from-ralph $(FROM_RALPH)"; \
+	fi; \
+	$(PYTHON) scripts/run_project.py --project "$(PROJECT)" --workflow "$(WORKFLOW)" --constants "$(CONSTANTS)" $$FROM_STEP_FLAG $$FROM_RALPH_FLAG $$INPUT_FLAG $$RALPH_FLAG $$CLI_FLAG $$MODEL_FLAG
 
 fixtures:
 	@mkdir -p fixtures

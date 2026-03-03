@@ -1031,38 +1031,11 @@ def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start
     
     current_index = start_index
     for change in changes:
-        before = str(change.get("before_snippet", ""))  # Extended context with surrounding words
-        exact_snippet = str(change.get("exact_snippet", ""))  # Exact text targeted (the old text)
-        after = str(change.get("after_snippet", ""))
-        op_type = change.get("type", "")
-        uncertain = change.get("location_uncertain", False)
-        annotation = change.get("annotation")
-        
-        # Build the At column and suggestion based on operation type
-        if op_type == "replace_range":
-            at_snippet, suggestion = format_replacement(before, exact_snippet, after)
-        elif op_type == "delete_range":
-            at_snippet, suggestion = format_deletion(before, exact_snippet)
-        elif op_type == "insert_at":
-            at_snippet = before
-            suggestion = _safe_bold(after) if after else ""
-        elif op_type == "add_comment":
-            at_snippet, suggestion = format_comment(before, exact_snippet, str(annotation) if annotation else "")
-        else:
-            at_snippet = before
-            suggestion = after
-        
-        # Skip entries that result in empty display (e.g., filtered conflict messages,
-        # whitespace-only changes, or empty comments)
-        if not at_snippet.strip() and not suggestion.strip():
+        formatted = _format_change_for_display(change)
+        if formatted is None:
             continue
 
-        if _is_edit_op(op_type):
-            suggestion = _normalize_markdown_suggestion_spacing(suggestion)
-        
-        # Note: uncertainty flag is tracked in metadata but not displayed in markdown
-        # to keep the output clean and professional
-        
+        at_snippet, suggestion = formatted
         # Escape pipe characters
         at_column = _escape_table_cell(at_snippet)
         suggestion = _escape_table_cell(suggestion)
@@ -1072,6 +1045,42 @@ def _render_changes_table(changes: list[dict[str, Any]], lines: list[str], start
     
     lines.append("")
     return current_index
+
+
+def _format_change_for_display(change: dict[str, Any]) -> tuple[str, str] | None:
+    before = str(change.get("before_snippet", ""))
+    exact_snippet = str(change.get("exact_snippet", ""))
+    after = str(change.get("after_snippet", ""))
+    op_type = str(change.get("type", ""))
+    annotation = change.get("annotation")
+
+    if op_type == "replace_range":
+        at_snippet, suggestion = format_replacement(before, exact_snippet, after)
+    elif op_type == "delete_range":
+        at_snippet, suggestion = format_deletion(before, exact_snippet)
+    elif op_type == "insert_at":
+        at_snippet = before
+        suggestion = _safe_bold(after) if after else ""
+    elif op_type == "add_comment":
+        at_snippet, suggestion = format_comment(before, exact_snippet, str(annotation) if annotation else "")
+    else:
+        at_snippet = before
+        suggestion = after
+
+    if not at_snippet.strip() and not suggestion.strip():
+        return None
+    if _is_edit_op(op_type):
+        suggestion = _normalize_markdown_suggestion_spacing(suggestion)
+    return at_snippet, suggestion
+
+
+def _split_changes_for_rendering(
+    changes: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    edits = [c for c in changes if _is_edit_op(str(c.get("type", "")))]
+    comments = [c for c in changes if _is_comment_op(str(c.get("type", "")))]
+    others = [c for c in changes if c not in edits and c not in comments]
+    return edits, comments, others
 
 
 def render_changes_markdown(payload: dict[str, Any]) -> str:
@@ -1098,10 +1107,7 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
     doc_name = _extract_document_name(payload.get("source_review_units", ""))
     suggestion_count = len(changes)
     
-    # Separate edits (replacements/deletions/insertions) from comments
-    edits = [c for c in changes if _is_edit_op(c.get("type", ""))]
-    comments = [c for c in changes if _is_comment_op(c.get("type", ""))]
-    others = [c for c in changes if c not in edits and c not in comments]
+    edits, comments, others = _split_changes_for_rendering(changes)
 
     lines: list[str] = [
         f"# Review — {doc_name} ({suggestion_count} suggestions)",
@@ -1151,6 +1157,118 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
             next_index = _render_changes_table(section_changes, lines, next_index)
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _parse_markdown_bold_segments(text: str) -> list[tuple[str, bool]]:
+    segments: list[tuple[str, bool]] = []
+    if not text:
+        return segments
+
+    buffer: list[str] = []
+    bold = False
+    index = 0
+    length = len(text)
+
+    while index < length:
+        if text.startswith("**", index):
+            if buffer:
+                segments.append(("".join(buffer), bold))
+                buffer = []
+            bold = not bold
+            index += 2
+            continue
+
+        char = text[index]
+        if char == "\\" and index + 1 < length:
+            escaped = text[index + 1]
+            if escaped in {"\\", "*", "`", "|"}:
+                buffer.append(escaped)
+                index += 2
+                continue
+
+        buffer.append(char)
+        index += 1
+
+    if buffer:
+        segments.append(("".join(buffer), bold))
+    return segments
+
+
+def _write_markdown_bold_to_paragraph(paragraph: Any, text: str) -> None:
+    paragraph.text = ""
+    for segment_text, is_bold in _parse_markdown_bold_segments(text):
+        if not segment_text:
+            continue
+        run = paragraph.add_run(segment_text)
+        run.bold = is_bold
+
+
+def _render_docx_section_tables(document: Any, section_changes: list[dict[str, Any]], start_index: int) -> int:
+    next_index = start_index
+    grouped = _group_changes_by_section(section_changes)
+    for section_name, grouped_changes in grouped.items():
+        if section_name:
+            document.add_heading(section_name, level=3)
+        table = document.add_table(rows=1, cols=3)
+        try:
+            table.style = "Table Grid"
+        except Exception:
+            pass
+
+        header_cells = table.rows[0].cells
+        header_cells[0].text = "#"
+        header_cells[1].text = "At"
+        header_cells[2].text = "Suggestion"
+
+        for change in grouped_changes:
+            formatted = _format_change_for_display(change)
+            if formatted is None:
+                continue
+
+            at_text, suggestion_text = formatted
+            cells = table.add_row().cells
+            cells[0].text = str(next_index)
+            _write_markdown_bold_to_paragraph(cells[1].paragraphs[0], at_text)
+            _write_markdown_bold_to_paragraph(cells[2].paragraphs[0], suggestion_text)
+            next_index += 1
+
+        document.add_paragraph("")
+
+    return next_index
+
+
+def render_changes_docx(payload: dict[str, Any], output_docx_path: Path) -> None:
+    try:
+        from docx import Document  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover - import path depends on env
+        raise RuntimeError(
+            "python-docx is required to generate DOCX change reports. "
+            "Install it with: python -m pip install python-docx"
+        ) from exc
+
+    changes = payload.get("changes", [])
+    if not isinstance(changes, list):
+        changes = []
+
+    document = Document()
+    doc_name = _extract_document_name(payload.get("source_review_units", ""))
+    document.add_heading(f"Review - {doc_name} ({len(changes)} suggestions)", level=1)
+
+    edits, comments, others = _split_changes_for_rendering(changes)
+    next_index = 1
+
+    if edits:
+        document.add_heading("Text Changes", level=2)
+        next_index = _render_docx_section_tables(document, edits, next_index)
+    if comments:
+        document.add_heading("Comments", level=2)
+        next_index = _render_docx_section_tables(document, comments, next_index)
+    if others:
+        document.add_heading("Other", level=2)
+        _render_docx_section_tables(document, others, next_index)
+
+    output_docx_path.parent.mkdir(parents=True, exist_ok=True)
+    document.save(output_docx_path)
 
 
 def build_change_report_payload(
@@ -1310,6 +1428,7 @@ def build_change_report_artifacts(
     apply_log_path: Path = DEFAULT_APPLY_LOG_PATH,
     output_md_path: Path = DEFAULT_OUTPUT_MD_PATH,
     output_json_path: Path = DEFAULT_OUTPUT_JSON_PATH,
+    output_docx_path: Path | None = None,
 ) -> dict[str, Any]:
     review_units_payload = load_json(review_units_path)
     patch_payload = load_json(patch_path)
@@ -1327,9 +1446,14 @@ def build_change_report_artifacts(
 
     dump_json(output_json_path, payload)
     dump_text(output_md_path, markdown)
+    if output_docx_path is not None:
+        render_changes_docx(payload, output_docx_path)
 
-    return {
+    result: dict[str, Any] = {
         "output_json": output_json_path,
         "output_md": output_md_path,
         "stats": payload["stats"],
     }
+    if output_docx_path is not None:
+        result["output_docx"] = output_docx_path
+    return result

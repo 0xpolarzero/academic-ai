@@ -6,6 +6,10 @@ import re
 import subprocess
 import sys
 from typing import Any
+import xml.etree.ElementTree as ET
+import zipfile
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +58,7 @@ def _run_report(
     apply_log_path: Path,
     output_md: Path,
     output_json: Path,
+    output_docx: Path | None = None,
 ) -> tuple[dict[str, Any], str]:
     project_dir = output_json.parent.parent
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -73,7 +78,8 @@ def _run_report(
             str(output_md),
             "--output-json",
             str(output_json),
-        ],
+        ]
+        + (["--output-docx", str(output_docx)] if output_docx is not None else []),
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
@@ -82,6 +88,8 @@ def _run_report(
 
     assert output_json.exists(), "Missing output changes.json"
     assert output_md.exists(), "Missing output changes.md"
+    if output_docx is not None:
+        assert output_docx.exists(), "Missing output changes.docx"
 
     payload = json.loads(output_json.read_text(encoding="utf-8"))
     markdown = output_md.read_text(encoding="utf-8")
@@ -518,3 +526,118 @@ def test_change_report_keeps_whitespace_changes_merges_adjacent_replacements_and
     # Unsafe markdown-bold text should remain unwrapped.
     assert "**A*B**" not in markdown
     assert "A\\*B" in markdown
+
+
+def test_change_report_emits_docx_table_and_bold_runs(tmp_path: Path) -> None:
+    pytest.importorskip("docx")
+
+    accepted_text = "Alpha beta gamma."
+    beta_start, beta_end = _utf16_span_for_occurrence(accepted_text, "beta")
+
+    review_units_path = tmp_path / "artifacts/docx_extract/review_units.json"
+    patch_path = tmp_path / "artifacts/patch/merged_patch.json"
+    apply_log_path = tmp_path / "artifacts/apply/apply_log.json"
+    output_md = tmp_path / "output/changes.md"
+    output_json = tmp_path / "output/changes.json"
+    output_docx = tmp_path / "output/changes.docx"
+
+    _write_json(
+        review_units_path,
+        {
+            "source_docx": "synthetic.docx",
+            "part_count": 1,
+            "unit_count": 1,
+            "units": [
+                {
+                    "part": "word/document.xml",
+                    "part_kind": "body",
+                    "part_name": "document",
+                    "para_id": "para_1",
+                    "unit_uid": "unit_1",
+                    "accepted_text": accepted_text,
+                    "heading_path": ["Section 1"],
+                    "order_index": 0,
+                    "location": {
+                        "global_order_index": 0,
+                        "paragraph_index_in_part": 0,
+                        "part_index": 0,
+                        "in_table": False,
+                        "path_hint": "word/document.xml::.//w:p[1]",
+                    },
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        patch_path,
+        {
+            "schema_version": "patch.v1",
+            "created_at": "2026-03-01T00:00:00Z",
+            "author": "test",
+            "ops": [
+                {
+                    "type": "replace_range",
+                    "target": {
+                        "part": "word/document.xml",
+                        "para_id": "para_1",
+                        "unit_uid": "unit_1",
+                    },
+                    "range": {"start": beta_start, "end": beta_end},
+                    "expected": {"snippet": "beta"},
+                    "replacement": "BETA",
+                }
+            ],
+        },
+    )
+
+    _write_json(
+        apply_log_path,
+        {
+            "schema_version": "apply_log.v1",
+            "created_at": "2026-03-01T00:00:01Z",
+            "ops": [
+                {
+                    "op_index": 0,
+                    "type": "replace_range",
+                    "target": {
+                        "part": "word/document.xml",
+                        "para_id": "para_1",
+                        "unit_uid": "unit_1",
+                    },
+                    "resolved_target": {
+                        "part": "word/document.xml",
+                        "para_id": "para_1",
+                        "unit_uid": "unit_1",
+                        "paragraph_index_in_part": 0,
+                    },
+                    "range": {"start": beta_start, "end": beta_end},
+                    "expected": {"snippet": "beta"},
+                    "actual_snippet": "beta",
+                    "status": "applied",
+                    "reason": None,
+                }
+            ],
+        },
+    )
+
+    _, _ = _run_report(
+        review_units_path=review_units_path,
+        patch_path=patch_path,
+        apply_log_path=apply_log_path,
+        output_md=output_md,
+        output_json=output_json,
+        output_docx=output_docx,
+    )
+
+    with zipfile.ZipFile(output_docx, mode="r") as zf:
+        assert zf.testzip() is None, "Output DOCX is not a valid zip package"
+        names = set(zf.namelist())
+        assert "word/document.xml" in names
+        document_root = ET.fromstring(zf.read("word/document.xml"))
+
+    w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    assert document_root.find(f".//{{{w_ns}}}tbl") is not None
+    assert document_root.find(f".//{{{w_ns}}}b") is not None
+    all_text = "".join(node.text or "" for node in document_root.findall(f".//{{{w_ns}}}t"))
+    assert "BETA" in all_text

@@ -31,6 +31,14 @@ from typing import Any
 
 
 CLI_EXEC_TIMEOUT_SECONDS = 600
+CODEX_SANDBOX_MODE = "read-only"
+CODEX_MAX_ATTEMPTS = 2
+CODEX_HEREDOC_ERROR_FRAGMENT = "can't create temp file for here document"
+CODEX_NO_SHELL_CONSTRAINTS = """<execution_constraints>
+Do not run shell commands, Python scripts, or terminal tools.
+Do not use heredocs (<<) or any command that requires temporary files.
+Read the required JSON files directly and return schema-valid JSON.
+</execution_constraints>"""
 
 
 def _load_schema_content(schema_path: Path) -> str:
@@ -39,6 +47,12 @@ def _load_schema_content(schema_path: Path) -> str:
         return schema_path.read_text(encoding="utf-8")
     except Exception:
         return "{}"
+
+
+def _with_codex_no_shell_constraints(prompt: str) -> str:
+    if CODEX_NO_SHELL_CONSTRAINTS in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{CODEX_NO_SHELL_CONSTRAINTS}\n"
 
 
 def _build_codex_command(
@@ -54,7 +68,7 @@ def _build_codex_command(
         "codex",
         "exec",
         "--cd", str(work_dir),
-        "--sandbox", "read-only",
+        "--sandbox", CODEX_SANDBOX_MODE,
         "--output-schema", str(schema_path),
         "--output-last-message", str(output_path),
         "-",
@@ -258,72 +272,98 @@ def _run_codex(
     model: str | None = None,
 ) -> dict[str, Any]:
     """Run Codex CLI with structured output."""
-    cmd = _build_codex_command(
-        prompt=prompt,
-        schema_path=schema_path,
-        work_dir=work_dir,
-        output_path=output_path,
-        model=model,
-    )
-    
-    log(f"[{phase}] Running Codex: {' '.join(cmd[:6])}...")
-    
-    proc = subprocess.Popen(
-        cmd,
-        cwd=work_dir,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    
-    try:
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-        
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-        
-        # Stream output
-        deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                raise RuntimeError(f"Codex timed out after {CLI_EXEC_TIMEOUT_SECONDS}s")
-            
-            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
-            if ready:
-                line = proc.stdout.readline()
-                if line:
-                    log(f"[{phase}] {line.rstrip()}")
+    prompt_for_attempt = prompt
+
+    for attempt in range(1, CODEX_MAX_ATTEMPTS + 1):
+        cmd = _build_codex_command(
+            prompt=prompt_for_attempt,
+            schema_path=schema_path,
+            work_dir=work_dir,
+            output_path=output_path,
+            model=model,
+        )
+
+        log(f"[{phase}] Running Codex: {' '.join(cmd[:6])}...")
+        if attempt > 1:
+            log(f"[{phase}] Retrying Codex with no-shell constraints after heredoc temp-file failure")
+
+        output_path.unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=work_dir,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        saw_heredoc_tempfile_error = False
+        try:
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+
+            proc.stdin.write(prompt_for_attempt)
+            proc.stdin.close()
+
+            # Stream output
+            deadline = time.monotonic() + CLI_EXEC_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    raise RuntimeError(f"Codex timed out after {CLI_EXEC_TIMEOUT_SECONDS}s")
+
+                ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+                if ready:
+                    line = proc.stdout.readline()
+                    if line:
+                        rendered = line.rstrip()
+                        log(f"[{phase}] {rendered}")
+                        if CODEX_HEREDOC_ERROR_FRAGMENT in rendered.lower():
+                            saw_heredoc_tempfile_error = True
+                            log(
+                                f"[{phase}] Detected heredoc temp-file failure in current sandbox mode"
+                            )
+                            proc.kill()
+                            break
+                        continue
+
+                if proc.poll() is not None:
+                    break
+
+            # Read remaining output
+            tail = proc.stdout.read()
+            if tail:
+                for line in tail.splitlines():
+                    log(f"[{phase}] {line}")
+
+            returncode = proc.wait()
+            if saw_heredoc_tempfile_error:
+                if attempt < CODEX_MAX_ATTEMPTS:
+                    prompt_for_attempt = _with_codex_no_shell_constraints(prompt_for_attempt)
                     continue
-            
-            if proc.poll() is not None:
-                break
-        
-        # Read remaining output
-        tail = proc.stdout.read()
-        if tail:
-            for line in tail.splitlines():
-                log(f"[{phase}] {line}")
-        
-        returncode = proc.wait()
-        if returncode != 0:
-            raise subprocess.CalledProcessError(returncode, cmd)
-        
-        # Read and return output
-        if not output_path.exists():
-            raise RuntimeError(f"Codex did not create output file: {output_path}")
-            
-        result = json.loads(output_path.read_text(encoding="utf-8"))
-        log(f"[{phase}] Codex completed successfully")
-        return result
-        
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+                raise RuntimeError(
+                    "Codex attempted a shell heredoc and could not create "
+                    "its temp file. Prompt was retried with no-shell constraints but failed again."
+                )
+
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, cmd)
+
+            # Read and return output
+            if not output_path.exists():
+                raise RuntimeError(f"Codex did not create output file: {output_path}")
+
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+            log(f"[{phase}] Codex completed successfully")
+            return result
+
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    raise RuntimeError("Codex execution failed after retry attempts.")
 
 
 def _run_claude(

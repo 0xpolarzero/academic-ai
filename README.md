@@ -35,6 +35,7 @@ projects/<project_slug>/
     apply/<input_name>/
   output/
     <input_name>_annotated.docx
+    <input_name>_changes.docx
     <input_name>_changes.md
     <input_name>_changes.json
 ```
@@ -64,6 +65,7 @@ Deterministic chunk-boundary fixes (runner behavior):
 
 - Final writer-facing outputs live in `projects/<project>/output/` only:
   - `<input_name>_annotated.docx`
+  - `<input_name>_changes.docx`
   - `<input_name>_changes.md`
   - `<input_name>_changes.json`
 - Intermediate/runtime artifacts live in `projects/<project>/artifacts/` only.
@@ -74,6 +76,7 @@ Deterministic chunk-boundary fixes (runner behavior):
 
 - Python 3.10+ (`.venv/bin/python` is used automatically when present, otherwise `python3`).
 - `pytest` installed in the selected Python environment for `make test`.
+- `python-docx` installed for DOCX change report generation (`<input_name>_changes.docx`).
 - `curl` or `wget` for `make fixtures` (manual fallback is documented in `fixtures/README.md`).
 
 ## Setup
@@ -81,7 +84,7 @@ Deterministic chunk-boundary fixes (runner behavior):
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip pytest
+python -m pip install --upgrade pip pytest python-docx
 ```
 
 ## Runbook
@@ -124,6 +127,7 @@ make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx RA
 
 ```text
 projects/thesis/output/<input_name>_annotated.docx
+projects/thesis/output/<input_name>_changes.docx
 projects/thesis/output/<input_name>_changes.md
 projects/thesis/output/<input_name>_changes.json
 ```
@@ -131,6 +135,7 @@ projects/thesis/output/<input_name>_changes.json
 For example, if you processed `chapter1.docx`:
 ```text
 projects/thesis/output/chapter1_annotated.docx
+projects/thesis/output/chapter1_changes.docx
 projects/thesis/output/chapter1_changes.md
 projects/thesis/output/chapter1_changes.json
 ```

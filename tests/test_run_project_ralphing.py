@@ -85,6 +85,7 @@ def _make_paths(run_project, tmp_path: Path, *, ralph_count: int, use_judge: boo
         chunk_result_sanitization_log=chunk_results_dir / "sanitization_report.json",
         apply_log=apply_dir / "apply_log.json",
         annotated_docx=output_dir / f"{input_name}_annotated.docx",
+        changes_docx=output_dir / f"{input_name}_changes.docx",
         changes_md=output_dir / f"{input_name}_changes.md",
         changes_json=output_dir / f"{input_name}_changes.json",
     )
@@ -236,6 +237,48 @@ def test_run_pipeline_ralph_three_skip_judge_merges_ralph0(tmp_path: Path, monke
     assert calls["ralph"] == [0, 1, 2]
     assert judge_calls["count"] == 0
     assert _extract_merge_chunk_results_arg(calls["commands"]) == "artifacts/ralph_0/chunk_results/chapter1"
+
+
+def test_run_pipeline_validation_targets_current_input_name(tmp_path: Path, monkeypatch):
+    run_project = _load_run_project_module()
+    paths = _make_paths(run_project, tmp_path, ralph_count=1, use_judge=False)
+
+    calls: dict[str, list] = {"commands": []}
+
+    def fake_run(cmd: list[str]) -> None:
+        calls["commands"].append(cmd)
+
+    monkeypatch.setattr(run_project, "_run", fake_run)
+    monkeypatch.setattr(run_project, "_run_chunk_qa_with_optional_fix", lambda *args, **kwargs: {"status": "ok", "passes": 1, "applied_fixes": []})
+    monkeypatch.setattr(
+        run_project,
+        "_run_single_ralph_review",
+        lambda *args, **kwargs: {"chunk_count": 1, "total_input_ops": 1, "total_output_ops": 1, "chunks": []},
+    )
+    monkeypatch.setattr(
+        run_project,
+        "_apply_merge_qa_overrides",
+        lambda *args, **kwargs: {"actions_in": 0, "actions_applied": 0, "actions_ignored": 0},
+    )
+    monkeypatch.setattr(run_project, "_assert_outputs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_project, "_enforce_no_sanitized_chunk_ops", lambda *args, **kwargs: None)
+
+    run_project.run_pipeline(
+        paths,
+        author="test",
+        dry_run=False,
+        validate=True,
+        max_concurrency=2,
+        cli="codex",
+        model=None,
+    )
+
+    validate_cmds = [cmd for cmd in calls["commands"] if str(run_project.VALIDATE_SCRIPT) in cmd]
+    assert len(validate_cmds) == 1
+    validate_cmd = validate_cmds[0]
+
+    assert "--input-name" in validate_cmd
+    assert validate_cmd[validate_cmd.index("--input-name") + 1] == paths.input_name
 
 
 def test_run_judge_phase_writes_schema_valid_raw_and_sanitized_results(tmp_path: Path, monkeypatch):

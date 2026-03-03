@@ -55,6 +55,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_JSON_PATH,
         help="Output JSON report path",
     )
+    parser.add_argument(
+        "--output-docx",
+        type=Path,
+        default=None,
+        help="Optional output DOCX report path",
+    )
     return parser
 
 
@@ -71,6 +77,7 @@ def main() -> int:
     apply_log_path = _resolve_project_path(project_dir, args.apply_log)
     output_md_path = _resolve_project_path(project_dir, args.output_md)
     output_json_path = _resolve_project_path(project_dir, args.output_json)
+    output_docx_path = _resolve_project_path(project_dir, args.output_docx) if args.output_docx else None
 
     if not review_units_path.exists():
         parser.error(f"review_units.json not found: {review_units_path}")
@@ -85,6 +92,7 @@ def main() -> int:
         apply_log_path=apply_log_path,
         output_md_path=output_md_path,
         output_json_path=output_json_path,
+        output_docx_path=output_docx_path,
     )
 
     stats = result["stats"]
@@ -94,6 +102,8 @@ def main() -> int:
     print(f"Apply log: {apply_log_path}")
     print(f"Wrote: {result['output_md']}")
     print(f"Wrote: {result['output_json']}")
+    if "output_docx" in result:
+        print(f"Wrote: {result['output_docx']}")
     print(f"Ops: total={stats['op_count']}")
 
     return 0

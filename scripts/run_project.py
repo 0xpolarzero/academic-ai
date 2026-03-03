@@ -22,6 +22,7 @@ from difflib import SequenceMatcher
 import xml.etree.ElementTree as ET
 from typing import Any
 from typing import TextIO
+from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,6 +98,7 @@ class ProjectPaths:
     annotated_docx: Path
     changes_md: Path
     changes_json: Path
+    changes_docx: Path
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-judge", action="store_true", help="When --ralph > 1, skip judge and use ralph_0 results directly")
     parser.add_argument("--cli", default="codex", choices=("codex", "claude", "kimi"), help="CLI provider to use for AI calls: codex, claude (Claude Code), or kimi (default: codex)")
     parser.add_argument("--model", default=None, help="Model to use for AI calls (e.g., 'gpt-5.3-codex', 'kimi-k2', 'sonnet')")
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--from-step",
+        choices=("judge", "merge", "apply", "report"),
+        default=None,
+        help="Resume from a pipeline step using existing artifacts: judge|merge|apply|report",
+    )
+    resume_group.add_argument(
+        "--from-ralph",
+        type=int,
+        default=None,
+        help="Resume from Ralph run index N (0-based), then continue to judge/merge/apply/report",
+    )
     return parser
 
 
@@ -2058,7 +2073,35 @@ def _resolve_paths(args: argparse.Namespace) -> ProjectPaths:
         annotated_docx=(project_dir / "output" / f"{input_name}_annotated.docx").resolve(),
         changes_md=(project_dir / "output" / f"{input_name}_changes.md").resolve(),
         changes_json=(project_dir / "output" / f"{input_name}_changes.json").resolve(),
+        changes_docx=(project_dir / "output" / f"{input_name}_changes.docx").resolve(),
     )
+
+
+def _resolve_resume_start(
+    args: argparse.Namespace,
+    paths: ProjectPaths,
+    *,
+    dry_run: bool,
+) -> tuple[Literal["extract", "judge", "merge", "apply", "report"], int | None]:
+    from_step = getattr(args, "from_step", None)
+    from_ralph = getattr(args, "from_ralph", None)
+
+    if from_step is None and from_ralph is None:
+        return "extract", None
+    if dry_run:
+        raise RuntimeError("--from-step/--from-ralph cannot be used with --dry-run")
+
+    if from_step is not None:
+        return str(from_step), None
+
+    start_index = int(from_ralph)
+    if start_index < 0:
+        raise RuntimeError("--from-ralph must be >= 0")
+    if start_index >= paths.ralph_count:
+        raise RuntimeError(
+            f"--from-ralph {start_index} is out of range for --ralph {paths.ralph_count}"
+        )
+    return "judge", start_index
 
 
 def _ensure_project_prereqs(paths: ProjectPaths) -> None:
@@ -2106,6 +2149,7 @@ def _assert_outputs(paths: ProjectPaths) -> None:
         paths.annotated_docx,
         paths.changes_md,
         paths.changes_json,
+        paths.changes_docx,
     ]
     missing = [path for path in required if not path.exists()]
     if missing:
@@ -2231,6 +2275,8 @@ def run_pipeline(
     validate: bool,
     max_concurrency: int,
     cli: str,
+    start_stage: Literal["extract", "judge", "merge", "apply", "report"] = "extract",
+    from_ralph: int | None = None,
     model: str | None = None,
 ) -> SyntheticChunkResult | None:
     input_rel_path = f"input/{paths.source_docx.name}"
@@ -2240,171 +2286,189 @@ def run_pipeline(
     patch_rel_dir = _project_rel_path(paths.project_dir, paths.patch_output_dir)
     apply_rel_dir = _project_rel_path(paths.project_dir, paths.apply_log.parent)
     output_docx_rel = _project_rel_path(paths.project_dir, paths.annotated_docx)
-    
-    _run(
-        [
-            sys.executable,
-            str(EXTRACT_SCRIPT),
-            "--project-dir",
-            str(paths.project_dir),
-            "--input-docx",
-            input_rel_path,
-            "--output-dir",
-            extract_rel_dir,
-        ]
-    )
+    stage_order = {"extract": 0, "judge": 1, "merge": 2, "apply": 3, "report": 4}
+    start_index = stage_order[start_stage]
 
-    _run(
-        [
-            sys.executable,
-            str(CHUNK_SCRIPT),
-            "--project-dir",
-            str(paths.project_dir),
-            "--constants",
-            str(paths.constants),
-            "--review-units",
-            f"{extract_rel_dir}/review_units.json",
-            "--linear-units",
-            f"{extract_rel_dir}/linear_units.json",
-            "--docx-struct",
-            f"{extract_rel_dir}/docx_struct.json",
-            "--output-dir",
-            chunks_rel_dir,
-        ]
-    )
+    if start_index <= stage_order["extract"]:
+        _run(
+            [
+                sys.executable,
+                str(EXTRACT_SCRIPT),
+                "--project-dir",
+                str(paths.project_dir),
+                "--input-docx",
+                input_rel_path,
+                "--output-dir",
+                extract_rel_dir,
+            ]
+        )
+
+        _run(
+            [
+                sys.executable,
+                str(CHUNK_SCRIPT),
+                "--project-dir",
+                str(paths.project_dir),
+                "--constants",
+                str(paths.constants),
+                "--review-units",
+                f"{extract_rel_dir}/review_units.json",
+                "--linear-units",
+                f"{extract_rel_dir}/linear_units.json",
+                "--docx-struct",
+                f"{extract_rel_dir}/docx_struct.json",
+                "--output-dir",
+                chunks_rel_dir,
+            ]
+        )
 
     synthetic: SyntheticChunkResult | None = None
-    if dry_run:
-        if paths.ralph_count > 1:
-            _log_line(
-                "Dry-run mode ignores additional ralph runs and writes a single synthetic result set "
-                f"to {paths.chunk_results_dir}"
-            )
-        _clear_chunk_result_artifacts(paths.chunk_results_dir)
-        synthetic = _discover_synthetic_chunk_result(paths)
-        _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
-    else:
-        qa = _run_chunk_qa_with_optional_fix(paths, cli=cli, model=model)
-        _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
-        ralph_summaries: list[dict[str, Any]] = []
-        for ralph_index in range(paths.ralph_count):
-            review_summary = _run_single_ralph_review(
-                paths,
-                ralph_index=ralph_index,
-                max_concurrency=max_concurrency,
-                cli=cli,
-                model=model,
-            )
-            ralph_summaries.append(review_summary)
-            _log_line(
-                f"Ralph run {ralph_index + 1}/{paths.ralph_count} complete: "
-                f"chunks={review_summary['chunk_count']} "
-                f"input_ops={review_summary['total_input_ops']} "
-                f"output_ops={review_summary['total_output_ops']}"
-            )
-
-        if paths.use_judge:
-            judge_summary = _run_judge_phase(paths, cli=cli, model=model)
-            _log_line(
-                "Judge phase complete: "
-                f"chunks={judge_summary['chunk_count']} "
-                f"input_ops={judge_summary['total_input_ops']} "
-                f"output_ops={judge_summary['total_output_ops']}"
-            )
-            _enforce_no_sanitized_chunk_ops(paths, judge_summary)
+    if start_index <= stage_order["judge"]:
+        if dry_run:
+            if paths.ralph_count > 1:
+                _log_line(
+                    "Dry-run mode ignores additional ralph runs and writes a single synthetic result set "
+                    f"to {paths.chunk_results_dir}"
+                )
+            _clear_chunk_result_artifacts(paths.chunk_results_dir)
+            synthetic = _discover_synthetic_chunk_result(paths)
+            _log_line(f"Synthetic chunk result: {synthetic.output_path} (ops={synthetic.op_count})")
         else:
-            _log_line("Judge phase skipped; merge will use ralph_0 results.")
-            if ralph_summaries:
-                _enforce_no_sanitized_chunk_ops(paths, ralph_summaries[0])
+            if from_ralph is None and start_stage == "extract":
+                qa = _run_chunk_qa_with_optional_fix(paths, cli=cli, model=model)
+                _log_line(f"Chunk QA status={qa['status']} passes={qa['passes']} applied_fixes={len(qa.get('applied_fixes', []))}")
 
-    _run(
-        [
-            sys.executable,
-            str(MERGE_SCRIPT),
-            "--project-dir",
-            str(paths.project_dir),
-            "--chunk-results-dir",
-            chunk_results_rel_dir,
-            "--linear-units",
-            f"{extract_rel_dir}/linear_units.json",
-            "--chunks-manifest",
-            f"{chunks_rel_dir}/manifest.json",
-            "--review-units",
-            f"{extract_rel_dir}/review_units.json",
-            "--output-dir",
-            patch_rel_dir,
-            "--author",
-            author,
-        ]
-    )
+            ralph_summaries: list[dict[str, Any]] = []
+            if from_ralph is not None:
+                ralph_indices = range(from_ralph, paths.ralph_count)
+            elif start_stage == "extract":
+                ralph_indices = range(paths.ralph_count)
+            else:
+                ralph_indices = range(0)
 
-    if dry_run:
-        _dump_json(paths.final_patch, _load_json(paths.merged_patch))
-        _dump_json(
-            paths.final_patch_overrides,
-            {
-                "actions_in": 0,
-                "actions_applied": 0,
-                "actions_ignored": 0,
-                "applied": [],
-                "ignored": [],
-                "merged_ops": len(_load_json(paths.merged_patch).get("ops", [])),
-                "final_ops": len(_load_json(paths.final_patch).get("ops", [])),
-            },
+            for ralph_index in ralph_indices:
+                review_summary = _run_single_ralph_review(
+                    paths,
+                    ralph_index=ralph_index,
+                    max_concurrency=max_concurrency,
+                    cli=cli,
+                    model=model,
+                )
+                ralph_summaries.append(review_summary)
+                _log_line(
+                    f"Ralph run {ralph_index + 1}/{paths.ralph_count} complete: "
+                    f"chunks={review_summary['chunk_count']} "
+                    f"input_ops={review_summary['total_input_ops']} "
+                    f"output_ops={review_summary['total_output_ops']}"
+                )
+
+            if paths.use_judge:
+                judge_summary = _run_judge_phase(paths, cli=cli, model=model)
+                _log_line(
+                    "Judge phase complete: "
+                    f"chunks={judge_summary['chunk_count']} "
+                    f"input_ops={judge_summary['total_input_ops']} "
+                    f"output_ops={judge_summary['total_output_ops']}"
+                )
+                _enforce_no_sanitized_chunk_ops(paths, judge_summary)
+            else:
+                _log_line("Judge phase skipped; merge will use ralph_0 results.")
+                if ralph_summaries:
+                    _enforce_no_sanitized_chunk_ops(paths, ralph_summaries[0])
+
+    if start_index <= stage_order["merge"]:
+        _run(
+            [
+                sys.executable,
+                str(MERGE_SCRIPT),
+                "--project-dir",
+                str(paths.project_dir),
+                "--chunk-results-dir",
+                chunk_results_rel_dir,
+                "--linear-units",
+                f"{extract_rel_dir}/linear_units.json",
+                "--chunks-manifest",
+                f"{chunks_rel_dir}/manifest.json",
+                "--review-units",
+                f"{extract_rel_dir}/review_units.json",
+                "--output-dir",
+                patch_rel_dir,
+                "--author",
+                author,
+            ]
         )
-    else:
-        override_report = _apply_merge_qa_overrides(paths, author=author, cli=cli, model=model)
-        _log_line(
-            "Merge QA overrides: "
-            f"actions_in={override_report['actions_in']} "
-            f"applied={override_report['actions_applied']} "
-            f"ignored={override_report['actions_ignored']}"
+
+        if dry_run:
+            _dump_json(paths.final_patch, _load_json(paths.merged_patch))
+            _dump_json(
+                paths.final_patch_overrides,
+                {
+                    "actions_in": 0,
+                    "actions_applied": 0,
+                    "actions_ignored": 0,
+                    "applied": [],
+                    "ignored": [],
+                    "merged_ops": len(_load_json(paths.merged_patch).get("ops", [])),
+                    "final_ops": len(_load_json(paths.final_patch).get("ops", [])),
+                },
+            )
+        else:
+            override_report = _apply_merge_qa_overrides(paths, author=author, cli=cli, model=model)
+            _log_line(
+                "Merge QA overrides: "
+                f"actions_in={override_report['actions_in']} "
+                f"applied={override_report['actions_applied']} "
+                f"ignored={override_report['actions_ignored']}"
+            )
+
+    if start_index <= stage_order["apply"]:
+        _run(
+            [
+                sys.executable,
+                str(APPLY_SCRIPT),
+                "--project-dir",
+                str(paths.project_dir),
+                "--input-docx",
+                input_rel_path,
+                "--patch",
+                f"{patch_rel_dir}/final_patch.json",
+                "--review-units",
+                f"{extract_rel_dir}/review_units.json",
+                "--output-docx",
+                output_docx_rel,
+                "--apply-log",
+                f"{apply_rel_dir}/apply_log.json",
+                "--author",
+                author,
+            ]
         )
 
-    _run(
-        [
-            sys.executable,
-            str(APPLY_SCRIPT),
-            "--project-dir",
-            str(paths.project_dir),
-            "--input-docx",
-            input_rel_path,
-            "--patch",
-            f"{patch_rel_dir}/final_patch.json",
-            "--review-units",
-            f"{extract_rel_dir}/review_units.json",
-            "--output-docx",
-            output_docx_rel,
-            "--apply-log",
-            f"{apply_rel_dir}/apply_log.json",
-            "--author",
-            author,
-        ]
-    )
-
-    _run(
-        [
-            sys.executable,
-            str(REPORT_SCRIPT),
-            "--project-dir",
-            str(paths.project_dir),
-            "--review-units",
-            f"{extract_rel_dir}/review_units.json",
-            "--patch",
-            f"{patch_rel_dir}/final_patch.json",
-            "--apply-log",
-            f"{apply_rel_dir}/apply_log.json",
-            "--output-md",
-            f"output/{paths.input_name}_changes.md",
-            "--output-json",
-            f"output/{paths.input_name}_changes.json",
-        ]
-    )
+    if start_index <= stage_order["report"]:
+        _run(
+            [
+                sys.executable,
+                str(REPORT_SCRIPT),
+                "--project-dir",
+                str(paths.project_dir),
+                "--review-units",
+                f"{extract_rel_dir}/review_units.json",
+                "--patch",
+                f"{patch_rel_dir}/final_patch.json",
+                "--apply-log",
+                f"{apply_rel_dir}/apply_log.json",
+                "--output-md",
+                f"output/{paths.input_name}_changes.md",
+                "--output-json",
+                f"output/{paths.input_name}_changes.json",
+                "--output-docx",
+                f"output/{paths.input_name}_changes.docx",
+            ]
+        )
 
     _assert_outputs(paths)
 
     if validate:
-        _run([sys.executable, str(VALIDATE_SCRIPT), "--project-dir", str(paths.project_dir)])
+        _run([sys.executable, str(VALIDATE_SCRIPT), "--project-dir", str(paths.project_dir), "--input-name", paths.input_name])
 
     return synthetic
 
@@ -2415,21 +2479,33 @@ def main() -> int:
 
     try:
         paths = _resolve_paths(args)
+        resume_start_stage, resume_from_ralph = _resolve_resume_start(
+            args,
+            paths,
+            dry_run=bool(args.dry_run),
+        )
         _init_run_log(paths.project_dir / "artifacts" / f"last_run_{paths.input_name}.txt")
         log_started = True
         _ensure_project_prereqs(paths)
 
-        for stale in [
-            paths.chunk_qa_report,
-            paths.merge_qa_report,
-            paths.final_patch,
-            paths.final_patch_overrides,
-        ]:
-            if stale.exists():
-                stale.unlink()
+        is_resume = resume_start_stage != "extract" or resume_from_ralph is not None
+        if not is_resume:
+            for stale in [
+                paths.chunk_qa_report,
+                paths.merge_qa_report,
+                paths.final_patch,
+                paths.final_patch_overrides,
+            ]:
+                if stale.exists():
+                    stale.unlink()
 
-        for chunk_results_dir in [*paths.ralph_chunk_results_dirs, paths.judged_chunk_results_dir]:
-            _clear_chunk_result_artifacts(chunk_results_dir)
+            for chunk_results_dir in [*paths.ralph_chunk_results_dirs, paths.judged_chunk_results_dir]:
+                _clear_chunk_result_artifacts(chunk_results_dir)
+        else:
+            if resume_from_ralph is not None:
+                _log_line(f"Resume mode: from Ralph run {resume_from_ralph}/{paths.ralph_count - 1}")
+            else:
+                _log_line(f"Resume mode: from step '{resume_start_stage}'")
 
         synthetic = run_pipeline(
             paths,
@@ -2438,6 +2514,8 @@ def main() -> int:
             validate=not bool(args.skip_validation),
             max_concurrency=int(args.max_concurrency),
             cli=str(args.cli),
+            start_stage=resume_start_stage,
+            from_ralph=resume_from_ralph,
             model=args.model,
         )
 
@@ -2451,6 +2529,7 @@ def main() -> int:
         _log_line(f"Final patch: {paths.final_patch}")
         _log_line(f"Annotated DOCX: {paths.annotated_docx}")
         _log_line(f"Change report: {paths.changes_md}")
+        _log_line(f"Change report DOCX: {paths.changes_docx}")
         if synthetic is not None:
             _log_line(f"Dry-run synthetic chunk result: {synthetic.output_path}")
 
