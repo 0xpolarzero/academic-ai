@@ -2157,6 +2157,120 @@ def _assert_outputs(paths: ProjectPaths) -> None:
         raise RuntimeError(f"Pipeline finished with missing outputs:\n{formatted}")
 
 
+def _shorten_log_text(value: str, *, limit: int = 120) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
+def _target_label(target: dict[str, Any]) -> str:
+    part = str(target.get("part", "")).strip() or "?"
+    para_id = str(target.get("para_id", "")).strip() or "?"
+    unit_uid = str(target.get("unit_uid", "")).strip()
+    if unit_uid:
+        return f"{part}:{para_id}:{unit_uid}"
+    return f"{part}:{para_id}"
+
+
+def _log_apply_failure_report(paths: ProjectPaths) -> None:
+    if not paths.apply_log.exists():
+        _log_line(f"Apply diagnostics skipped: missing apply log at {paths.apply_log}", stderr=True)
+        return
+    if not paths.final_patch.exists():
+        _log_line(f"Apply diagnostics skipped: missing final patch at {paths.final_patch}", stderr=True)
+        return
+
+    try:
+        apply_payload = _load_json(paths.apply_log)
+        final_patch = _load_json(paths.final_patch)
+    except Exception as exc:  # pragma: no cover - defensive parsing guard
+        _log_line(f"Apply diagnostics skipped due to parse error: {exc}", stderr=True)
+        return
+
+    stats = apply_payload.get("stats", {})
+    ops = apply_payload.get("ops", [])
+    patch_ops = final_patch.get("ops", [])
+    if not isinstance(stats, dict) or not isinstance(ops, list) or not isinstance(patch_ops, list):
+        _log_line("Apply diagnostics skipped: invalid apply_log/final_patch structure", stderr=True)
+        return
+
+    def _parse_int(value: Any, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    failed_ops = [entry for entry in ops if isinstance(entry, dict) and str(entry.get("status", "")) != "applied"]
+    if not failed_ops:
+        _log_line(
+            "Apply stage summary: all operations applied "
+            f"(input={stats.get('input_ops', 'n/a')} applied={stats.get('applied_ops', 'n/a')} skipped=0)."
+        )
+        return
+
+    _log_line("WARNING: Some suggestions were NOT applied to the DOCX.", stderr=True)
+    _log_line(
+        "Apply stage summary: "
+        f"input={stats.get('input_ops', 'n/a')} "
+        f"applied={stats.get('applied_ops', 'n/a')} "
+        f"skipped={stats.get('skipped_ops', 'n/a')}",
+        stderr=True,
+    )
+
+    reason_counts = Counter(str(entry.get("reason", "unknown") or "unknown") for entry in failed_ops)
+    _log_line("Skipped-op breakdown by reason:", stderr=True)
+    for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0])):
+        _log_line(f"  - {reason}: {count}", stderr=True)
+
+    _log_line("Detailed skipped ops:", stderr=True)
+    for entry in sorted(failed_ops, key=lambda item: _parse_int(item.get("op_index"), 10**9)):
+        op_index = _parse_int(entry.get("op_index"), -1)
+        patch_op: dict[str, Any] = {}
+        if 0 <= op_index < len(patch_ops) and isinstance(patch_ops[op_index], dict):
+            patch_op = patch_ops[op_index]
+
+        target = patch_op.get("target") if isinstance(patch_op.get("target"), dict) else entry.get("target", {})
+        if not isinstance(target, dict):
+            target = {}
+        expected = patch_op.get("expected") if isinstance(patch_op.get("expected"), dict) else entry.get("expected", {})
+        if not isinstance(expected, dict):
+            expected = {}
+
+        snippet = _shorten_log_text(str(expected.get("snippet", "")), limit=100)
+        actual = _shorten_log_text(str(entry.get("actual_snippet", "")), limit=100)
+
+        _log_line(
+            "  - "
+            f"op#{op_index} "
+            f"type={entry.get('type', patch_op.get('type', '?'))} "
+            f"reason={entry.get('reason', 'unknown')} "
+            f"target={_target_label(target)} "
+            f"expected=\"{snippet}\" "
+            f"actual=\"{actual}\"",
+            stderr=True,
+        )
+
+    _log_line("Recovery suggestions:", stderr=True)
+    _log_line(
+        "  1. Re-run with stronger ensemble consensus: "
+        f"`python scripts/run_project.py --project {paths.project_dir.name} --workflow {paths.workflow_xml.stem} "
+        f"--input {paths.source_docx.name} --ralph 3`",
+        stderr=True,
+    )
+    _log_line(
+        "  2. Re-run from apply/report after regenerating patch artifacts if needed: "
+        f"`python scripts/run_project.py --project {paths.project_dir.name} --workflow {paths.workflow_xml.stem} "
+        f"--input {paths.source_docx.name} --from-step apply`",
+        stderr=True,
+    )
+    _log_line(
+        "  3. Review and manually apply remaining suggestions in Word from the section "
+        f"'Not Applied (Manual Review Required)' in {paths.changes_md}",
+        stderr=True,
+    )
+
+
 def _resolve_action_index(action: dict[str, Any], base_ops: list[dict[str, Any]]) -> int | None:
     if "op_index" in action and isinstance(action.get("op_index"), int):
         index = int(action["op_index"])
@@ -2464,6 +2578,8 @@ def run_pipeline(
                 f"output/{paths.input_name}_changes.docx",
             ]
         )
+
+        _log_apply_failure_report(paths)
 
     _assert_outputs(paths)
 

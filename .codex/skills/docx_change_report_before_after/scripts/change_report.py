@@ -104,7 +104,12 @@ def main() -> int:
     print(f"Wrote: {result['output_json']}")
     if "output_docx" in result:
         print(f"Wrote: {result['output_docx']}")
-    print(f"Ops: total={stats['op_count']}")
+    print(
+        "Ops: "
+        f"applied={stats.get('applied_op_count', stats.get('op_count', 'n/a'))} "
+        f"failed={stats.get('failed_op_count', 0)} "
+        f"patch_total={stats.get('input_patch_ops', 'n/a')}"
+    )
 
     return 0
 

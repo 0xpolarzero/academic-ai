@@ -470,6 +470,13 @@ def main() -> int:
             f"applied={stats.get('applied_ops', 'n/a')} "
             f"skipped={stats.get('skipped_ops', 'n/a')}"
         )
+        skipped_ops = int(stats.get("skipped_ops", 0) or 0)
+        if skipped_ops > 0:
+            print("WARNING: Some suggestions were not applied.")
+            print("Recovery suggestions:")
+            print("1. Re-run with multiple Ralph passes (`--ralph 3` or higher).")
+            print("2. Re-run from apply/report after patch refresh.")
+            print(f"3. Review 'Not Applied (Manual Review Required)' in {paths.changes_md}.")
         return 0
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}: {exc.cmd}", file=sys.stderr)

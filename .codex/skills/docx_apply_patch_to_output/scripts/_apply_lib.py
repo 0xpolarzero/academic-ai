@@ -147,6 +147,20 @@ class CharToken:
 
 
 @dataclass(frozen=True)
+class RunTemplate:
+    attrs: tuple[tuple[str, str], ...]
+    rpr: ET.Element | None
+
+
+@dataclass(frozen=True)
+class PreservedInlineEvent:
+    pos_cp: int
+    style_key: str
+    sequence: int
+    element: ET.Element
+
+
+@dataclass(frozen=True)
 class InsertEvent:
     pos_cp: int
     text: str
@@ -174,26 +188,20 @@ class CommentEvent:
 
 
 class ParagraphBuilder:
-    def __init__(self, paragraph: ET.Element, style_pool: dict[str, ET.Element]) -> None:
+    def __init__(self, paragraph: ET.Element, style_pool: dict[str, RunTemplate]) -> None:
         self._paragraph = paragraph
         self._style_pool = style_pool
         self._pending_text = ""
         self._pending_style_key = ""
 
-    def _clone_rpr(self, style_key: str) -> ET.Element | None:
-        base = self._style_pool.get(style_key)
-        if base is None:
-            return None
-        return copy.deepcopy(base)
+    def _make_run(self, style_key: str) -> ET.Element:
+        return _make_run_from_template(self._style_pool, style_key)
 
     def _flush_text(self) -> None:
         if not self._pending_text:
             return
 
-        run = ET.Element(qn(W_NS, "r"))
-        rpr = self._clone_rpr(self._pending_style_key)
-        if rpr is not None:
-            run.append(rpr)
+        run = self._make_run(self._pending_style_key)
 
         text_node = ET.SubElement(run, qn(W_NS, "t"))
         if _leading_or_trailing_space(self._pending_text):
@@ -216,10 +224,7 @@ class ParagraphBuilder:
             return
 
         self._flush_text()
-        run = ET.Element(qn(W_NS, "r"))
-        rpr = self._clone_rpr(token.style_key)
-        if rpr is not None:
-            run.append(rpr)
+        run = self._make_run(token.style_key)
 
         if token.kind == "tab":
             ET.SubElement(run, qn(W_NS, "tab"))
@@ -232,55 +237,87 @@ class ParagraphBuilder:
         self._flush_text()
         self._paragraph.append(element)
 
+    def append_preserved_inline(self, event: PreservedInlineEvent) -> None:
+        self._flush_text()
+        run = self._make_run(event.style_key)
+        run.append(copy.deepcopy(event.element))
+        self._paragraph.append(run)
+
     def finalize(self) -> None:
         self._flush_text()
 
 
-def _serialize_rpr(rpr: ET.Element | None) -> str:
-    if rpr is None:
-        return ""
-    return ET.tostring(rpr, encoding="unicode")
+def _make_run_template(run: ET.Element) -> RunTemplate:
+    attrs = tuple(sorted((str(key), str(value)) for key, value in run.attrib.items()))
+    rpr = run.find("w:rPr", NS)
+    return RunTemplate(
+        attrs=attrs,
+        rpr=copy.deepcopy(rpr) if rpr is not None else None,
+    )
 
 
-def _paragraph_tokens(paragraph: ET.Element) -> tuple[list[CharToken], dict[str, ET.Element]]:
-    parent_map = _build_parent_map(paragraph)
-    style_pool: dict[str, ET.Element] = {}
-    run_style_cache: dict[int, str] = {}
-
-    def style_key_for_node(node: ET.Element) -> str:
-        run = _closest_ancestor_with_local_name(node, parent_map, "r")
-        if run is None:
-            return ""
-
-        run_id = id(run)
-        if run_id in run_style_cache:
-            return run_style_cache[run_id]
-
-        rpr = run.find("w:rPr", NS)
-        key = _serialize_rpr(rpr)
-        if rpr is not None and key not in style_pool:
-            style_pool[key] = copy.deepcopy(rpr)
-        run_style_cache[run_id] = key
-        return key
-
+def _paragraph_tokens(
+    paragraph: ET.Element,
+) -> tuple[list[CharToken], dict[str, RunTemplate], list[PreservedInlineEvent]]:
+    style_pool: dict[str, RunTemplate] = {}
     tokens: list[CharToken] = []
-    for node in paragraph.iter():
-        if node.tag == qn(W_NS, "t") and node.text:
-            style_key = style_key_for_node(node)
-            for char in node.text:
-                tokens.append(CharToken(char=char, kind="text", style_key=style_key))
+    preserved_inline: list[PreservedInlineEvent] = []
+
+    cp_offset = 0
+    preserved_sequence = 0
+    run_counter = 0
+
+    for child in list(paragraph):
+        if child.tag != qn(W_NS, "r"):
             continue
 
-        if node.tag == qn(W_NS, "tab"):
-            style_key = style_key_for_node(node)
-            tokens.append(CharToken(char="\t", kind="tab", style_key=style_key))
-            continue
+        style_key = f"run_{run_counter}"
+        run_counter += 1
+        style_pool[style_key] = _make_run_template(child)
 
-        if node.tag in {qn(W_NS, "br"), qn(W_NS, "cr")}:
-            style_key = style_key_for_node(node)
-            tokens.append(CharToken(char="\n", kind="br", style_key=style_key))
+        for run_child in list(child):
+            if run_child.tag == qn(W_NS, "rPr"):
+                continue
 
-    return tokens, style_pool
+            if run_child.tag == qn(W_NS, "t"):
+                text = run_child.text or ""
+                if text:
+                    for char in text:
+                        tokens.append(CharToken(char=char, kind="text", style_key=style_key))
+                        cp_offset += 1
+                else:
+                    preserved_inline.append(
+                        PreservedInlineEvent(
+                            pos_cp=cp_offset,
+                            style_key=style_key,
+                            sequence=preserved_sequence,
+                            element=copy.deepcopy(run_child),
+                        )
+                    )
+                    preserved_sequence += 1
+                continue
+
+            if run_child.tag == qn(W_NS, "tab"):
+                tokens.append(CharToken(char="\t", kind="tab", style_key=style_key))
+                cp_offset += 1
+                continue
+
+            if run_child.tag in {qn(W_NS, "br"), qn(W_NS, "cr")}:
+                tokens.append(CharToken(char="\n", kind="br", style_key=style_key))
+                cp_offset += 1
+                continue
+
+            preserved_inline.append(
+                PreservedInlineEvent(
+                    pos_cp=cp_offset,
+                    style_key=style_key,
+                    sequence=preserved_sequence,
+                    element=copy.deepcopy(run_child),
+                )
+            )
+            preserved_sequence += 1
+
+    return tokens, style_pool, preserved_inline
 
 
 def _paragraph_text(paragraph: ET.Element) -> str:
@@ -304,20 +341,23 @@ def _paragraph_has_unsupported_structure(paragraph: ET.Element) -> bool:
     return False
 
 
-def _clone_rpr_from_pool(style_pool: dict[str, ET.Element], style_key: str) -> ET.Element | None:
-    if not style_key:
-        return None
-    base = style_pool.get(style_key)
-    if base is None:
-        return None
-    return copy.deepcopy(base)
-
-
-def _make_text_run(*, text: str, style_pool: dict[str, ET.Element], style_key: str, deleted: bool) -> ET.Element:
+def _make_run_from_template(style_pool: dict[str, RunTemplate], style_key: str) -> ET.Element:
     run = ET.Element(qn(W_NS, "r"))
-    rpr = _clone_rpr_from_pool(style_pool, style_key)
-    if rpr is not None:
-        run.append(rpr)
+    template = style_pool.get(style_key)
+    if template is None:
+        return run
+
+    for key, value in template.attrs:
+        run.set(key, value)
+
+    if template.rpr is not None:
+        run.append(copy.deepcopy(template.rpr))
+
+    return run
+
+
+def _make_text_run(*, text: str, style_pool: dict[str, RunTemplate], style_key: str, deleted: bool) -> ET.Element:
+    run = _make_run_from_template(style_pool, style_key)
 
     tag = qn(W_NS, "delText") if deleted else qn(W_NS, "t")
     text_node = ET.SubElement(run, tag)
@@ -330,7 +370,7 @@ def _make_text_run(*, text: str, style_pool: dict[str, ET.Element], style_key: s
 def _make_ins_element(
     *,
     event: InsertEvent,
-    style_pool: dict[str, ET.Element],
+    style_pool: dict[str, RunTemplate],
     author: str,
     timestamp: str,
 ) -> ET.Element:
@@ -351,7 +391,7 @@ def _make_ins_element(
 def _make_del_element(
     *,
     event: DeleteEvent,
-    style_pool: dict[str, ET.Element],
+    style_pool: dict[str, RunTemplate],
     author: str,
     timestamp: str,
 ) -> ET.Element:
@@ -391,6 +431,51 @@ def _style_key_for_offset(tokens: list[CharToken], cp_offset: int) -> str:
         if token.style_key:
             return token.style_key
     return ""
+
+
+def _range_intersects_preserved_inline_element(
+    *,
+    start_cp: int,
+    end_cp: int,
+    preserved_inline: list[PreservedInlineEvent],
+) -> bool:
+    if start_cp >= end_cp:
+        return False
+    for event in preserved_inline:
+        if start_cp <= event.pos_cp < end_cp:
+            return True
+    return False
+
+
+def _preserved_inline_signature(paragraph: ET.Element) -> list[str]:
+    signature: list[str] = []
+    for run in paragraph.findall("w:r", NS):
+        for child in list(run):
+            if child.tag == qn(W_NS, "rPr"):
+                continue
+            if child.tag in {
+                qn(W_NS, "t"),
+                qn(W_NS, "tab"),
+                qn(W_NS, "br"),
+                qn(W_NS, "cr"),
+                qn(W_NS, "commentReference"),
+            }:
+                continue
+            signature.append(ET.tostring(child, encoding="unicode"))
+    return signature
+
+
+def _restore_paragraph(paragraph: ET.Element, original: ET.Element) -> None:
+    for child in list(paragraph):
+        paragraph.remove(child)
+
+    paragraph.attrib.clear()
+    paragraph.attrib.update(original.attrib)
+    paragraph.text = original.text
+    paragraph.tail = original.tail
+
+    for child in list(original):
+        paragraph.append(copy.deepcopy(child))
 
 
 def _ranges_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
@@ -712,7 +797,8 @@ def _rebuild_paragraph(
     *,
     paragraph: ET.Element,
     tokens: list[CharToken],
-    style_pool: dict[str, ET.Element],
+    style_pool: dict[str, RunTemplate],
+    preserved_inline_by_pos: dict[int, list[PreservedInlineEvent]],
     delete_by_start: dict[int, DeleteEvent],
     insert_pre: dict[int, list[InsertEvent]],
     insert_post: dict[int, list[InsertEvent]],
@@ -742,6 +828,9 @@ def _rebuild_paragraph(
             builder.append_element(
                 _make_ins_element(event=event, style_pool=style_pool, author=author, timestamp=timestamp)
             )
+
+        for event in sorted(preserved_inline_by_pos.get(pos, []), key=lambda item: item.sequence):
+            builder.append_preserved_inline(event)
 
         delete_event = delete_by_start.get(pos)
         if delete_event is not None:
@@ -888,7 +977,14 @@ def apply_patch_to_output(
                 entry["reason"] = "unsupported_paragraph_structure"
             continue
 
-        tokens, style_pool = _paragraph_tokens(paragraph)
+        original_paragraph = copy.deepcopy(paragraph)
+        original_inline_signature = _preserved_inline_signature(paragraph)
+
+        tokens, style_pool, preserved_inline = _paragraph_tokens(paragraph)
+        preserved_inline_by_pos: dict[int, list[PreservedInlineEvent]] = defaultdict(list)
+        for event in preserved_inline:
+            preserved_inline_by_pos[event.pos_cp].append(event)
+
         paragraph_text = "".join(token.char for token in tokens)
         _, utf16_to_cp = _utf16_map(paragraph_text)
 
@@ -897,9 +993,11 @@ def apply_patch_to_output(
         insert_post: dict[int, list[InsertEvent]] = defaultdict(list)
         comment_starts: dict[int, list[CommentEvent]] = defaultdict(list)
         comment_ends: dict[int, list[CommentEvent]] = defaultdict(list)
+        pending_comment_bodies: list[tuple[int, str]] = []
         occupied_delete_ranges: list[tuple[int, int]] = []
 
         any_applied = False
+        applied_entries: list[dict[str, Any]] = []
         sorted_records = _sort_ops_descending(group_records)
 
         for record in sorted_records:
@@ -944,6 +1042,15 @@ def apply_patch_to_output(
                 continue
 
             if op_type in {"replace_range", "delete_range"}:
+                if _range_intersects_preserved_inline_element(
+                    start_cp=start_cp,
+                    end_cp=end_cp,
+                    preserved_inline=preserved_inline,
+                ):
+                    entry["status"] = "skipped"
+                    entry["reason"] = "range_intersects_preserved_inline_element"
+                    continue
+
                 current_range = (start_cp, end_cp)
                 if any(_ranges_overlap(current_range, used_range) for used_range in occupied_delete_ranges):
                     entry["status"] = "skipped"
@@ -1010,14 +1117,7 @@ def apply_patch_to_output(
 
                 comment_starts[start_cp].append(comment_event)
                 comment_ends[end_cp].append(comment_event)
-                _append_comment_body(
-                    comments_root,
-                    comment_id=comment_event.comment_id,
-                    comment_text=comment_text,
-                    author=author,
-                    timestamp=_now_iso(),
-                )
-                parts_with_comments.add(locator.part)
+                pending_comment_bodies.append((comment_event.comment_id, comment_text))
                 entry["comment_id"] = comment_event.comment_id
                 entry["location_uncertain"] = location_uncertain
                 # Also record actual_snippet for debugging purposes
@@ -1028,6 +1128,7 @@ def apply_patch_to_output(
             entry["reason"] = None
             entry["actual_snippet"] = actual_snippet
             any_applied = True
+            applied_entries.append(entry)
 
         if not any_applied:
             continue
@@ -1036,6 +1137,7 @@ def apply_patch_to_output(
             paragraph=paragraph,
             tokens=tokens,
             style_pool=style_pool,
+            preserved_inline_by_pos=preserved_inline_by_pos,
             delete_by_start=delete_by_start,
             insert_pre=insert_pre,
             insert_post=insert_post,
@@ -1044,6 +1146,30 @@ def apply_patch_to_output(
             author=author,
             timestamp=_now_iso(),
         )
+
+        updated_inline_signature = _preserved_inline_signature(paragraph)
+        if updated_inline_signature != original_inline_signature:
+            _restore_paragraph(paragraph, original_paragraph)
+            for entry in applied_entries:
+                entry["status"] = "skipped"
+                entry["reason"] = "inline_element_integrity_mismatch"
+                entry.pop("revision_ids", None)
+                entry.pop("comment_id", None)
+                entry.pop("location_uncertain", None)
+            continue
+
+        for comment_id, comment_text in pending_comment_bodies:
+            _append_comment_body(
+                comments_root,
+                comment_id=comment_id,
+                comment_text=comment_text,
+                author=author,
+                timestamp=_now_iso(),
+            )
+
+        if pending_comment_bodies:
+            parts_with_comments.add(locator.part)
+
         parts_modified.add(locator.part)
 
     for part in sorted(parts_modified):
@@ -1091,6 +1217,12 @@ def apply_patch_to_output(
             "applied_comment_ops": applied_comment_ops,
             "skipped_unsupported_paragraph_structure": sum(
                 1 for item in log_entries if item.get("reason") == "unsupported_paragraph_structure"
+            ),
+            "skipped_range_intersects_preserved_inline_element": sum(
+                1 for item in log_entries if item.get("reason") == "range_intersects_preserved_inline_element"
+            ),
+            "skipped_inline_element_integrity_mismatch": sum(
+                1 for item in log_entries if item.get("reason") == "inline_element_integrity_mismatch"
             ),
             "parts_modified": sorted(parts_modified),
             "parts_with_comments": sorted(parts_with_comments),

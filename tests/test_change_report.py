@@ -222,7 +222,15 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
 
     assert payload["schema_version"] == "change_report.v1"
     assert payload["stats"]["op_count"] == 1
+    assert payload["stats"]["failed_op_count"] == 1
+    assert payload["stats"]["input_patch_ops"] == 2
     # Stats count only applied operations present in annotated DOCX.
+
+    assert len(payload.get("failed_ops", [])) == 1
+    failed = payload["failed_ops"][0]
+    assert failed["op_index"] == 1
+    assert failed["skip_reason"] == "target_not_found"
+    assert "ralph" in failed["failure_guidance"].lower()
 
     first_change = payload["changes"][0]
     assert first_change["location"]["heading_path"] == ["Section 1"]
@@ -243,6 +251,8 @@ def test_change_report_emits_stable_location_before_after_and_status(tmp_path: P
     assert "1 suggestions" in markdown
     assert "Section 1" in markdown
     assert "| # | At | Suggestion |" in markdown
+    assert "## Not Applied (Manual Review Required)" in markdown
+    assert "target_not_found" in markdown
     # Context in both columns, old text bold in At, new text bold in Suggestion
     assert "**beta**" in markdown  # Old text bold
     assert "**BETA**" in markdown  # New text bold

@@ -20,6 +20,16 @@ CHANGE_REPORT_SCHEMA_VERSION = "change_report.v1"
 UNSAFE_BOLD_CHARS = {"*", "`", "\n", "\r"}
 SPACE_MARKER = "␠"
 
+GENERIC_RECOVERY_GUIDANCE = (
+    "Re-run with multiple Ralph passes (`--ralph 3` or higher), then rerun apply/report. "
+    "If it still fails, apply this suggestion manually in Word."
+)
+
+STRUCTURAL_RECOVERY_GUIDANCE = (
+    "This target intersects protected document structure (for example footnotes, fields, or inline OOXML). "
+    "Keep this suggestion and apply it manually in Word. Optionally rerun with `--ralph 3+`."
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -127,6 +137,33 @@ def _first_non_empty(*values: str) -> str:
         if value:
             return value
     return ""
+
+
+def _failure_guidance_for_reason(reason: str) -> str:
+    normalized = reason.strip()
+    if normalized in {
+        "range_intersects_preserved_inline_element",
+        "inline_element_integrity_mismatch",
+        "unsupported_paragraph_structure",
+    }:
+        return STRUCTURAL_RECOVERY_GUIDANCE
+
+    if normalized in {
+        "snippet_mismatch",
+        "target_not_found",
+        "target_part_missing_in_docx",
+        "target_paragraph_not_found",
+        "invalid_utf16_boundary",
+        "range_out_of_bounds",
+        "overlapping_edit_in_group",
+        "duplicate_delete_start",
+        "insert_requires_collapsed_range",
+        "empty_edit_range",
+        "missing_apply_log_entry",
+    }:
+        return GENERIC_RECOVERY_GUIDANCE
+
+    return GENERIC_RECOVERY_GUIDANCE
 
 
 def _resolve_unit(
@@ -1074,6 +1111,51 @@ def _format_change_for_display(change: dict[str, Any]) -> tuple[str, str] | None
     return at_snippet, suggestion
 
 
+def _format_failed_change_for_display(change: dict[str, Any]) -> tuple[str, str]:
+    formatted = _format_change_for_display(change)
+    if formatted is not None:
+        return formatted
+
+    at_snippet = str(change.get("exact_snippet", "")).strip() or str(change.get("before_snippet", "")).strip()
+    suggestion = str(change.get("after_snippet", "")).strip()
+    annotation = str(change.get("annotation", "")).strip()
+
+    if not at_snippet:
+        at_snippet = "*(empty target)*"
+    if not suggestion and annotation:
+        suggestion = annotation
+    if not suggestion:
+        suggestion = "*(no replacement text)*"
+    return at_snippet, suggestion
+
+
+def _render_failed_ops_table(failed_ops: list[dict[str, Any]], lines: list[str], start_index: int) -> int:
+    if not failed_ops:
+        return start_index
+
+    lines.append("| # | At | Suggestion | Failure | Recovery |")
+    lines.append("|---|----|------------|---------|----------|")
+
+    current_index = start_index
+    for change in failed_ops:
+        at_snippet, suggestion = _format_failed_change_for_display(change)
+        reason = str(change.get("skip_reason", "")).strip() or "unknown"
+        guidance = str(change.get("failure_guidance", "")).strip() or GENERIC_RECOVERY_GUIDANCE
+
+        lines.append(
+            "| "
+            f"{current_index} | "
+            f"{_escape_table_cell(at_snippet)} | "
+            f"{_escape_table_cell(suggestion)} | "
+            f"{_escape_table_cell(reason)} | "
+            f"{_escape_table_cell(guidance)} |"
+        )
+        current_index += 1
+
+    lines.append("")
+    return current_index
+
+
 def _split_changes_for_rendering(
     changes: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1103,6 +1185,9 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
     changes = payload.get("changes", [])
     if not isinstance(changes, list):
         changes = []
+    failed_ops = payload.get("failed_ops", [])
+    if not isinstance(failed_ops, list):
+        failed_ops = []
 
     doc_name = _extract_document_name(payload.get("source_review_units", ""))
     suggestion_count = len(changes)
@@ -1113,6 +1198,12 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
         f"# Review — {doc_name} ({suggestion_count} suggestions)",
         "",
     ]
+    if failed_ops:
+        lines.append(
+            f"> ⚠️ {len(failed_ops)} suggestions were not applied automatically. "
+            "They are preserved in **Not Applied (Manual Review Required)** below."
+        )
+        lines.append("")
     
     # Use sequential numbering across all sections (Issue #23)
     next_index = 1
@@ -1155,6 +1246,16 @@ def render_changes_markdown(payload: dict[str, Any]) -> str:
                 lines.append(f"### {section_name}")
                 lines.append("")
             next_index = _render_changes_table(section_changes, lines, next_index)
+
+    if failed_ops:
+        lines.append("## Not Applied (Manual Review Required)")
+        lines.append("")
+        lines.append("Recommended recovery steps:")
+        lines.append("1. Re-run with multiple Ralph passes (`--ralph 3` or higher).")
+        lines.append("2. Re-run from apply/report once patch artifacts are refreshed.")
+        lines.append("3. If still blocked, apply the remaining suggestions manually in Word.")
+        lines.append("")
+        next_index = _render_failed_ops_table(failed_ops, lines, next_index)
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1249,6 +1350,9 @@ def render_changes_docx(payload: dict[str, Any], output_docx_path: Path) -> None
     changes = payload.get("changes", [])
     if not isinstance(changes, list):
         changes = []
+    failed_ops = payload.get("failed_ops", [])
+    if not isinstance(failed_ops, list):
+        failed_ops = []
 
     document = Document()
     doc_name = _extract_document_name(payload.get("source_review_units", ""))
@@ -1265,7 +1369,41 @@ def render_changes_docx(payload: dict[str, Any], output_docx_path: Path) -> None
         next_index = _render_docx_section_tables(document, comments, next_index)
     if others:
         document.add_heading("Other", level=2)
-        _render_docx_section_tables(document, others, next_index)
+        next_index = _render_docx_section_tables(document, others, next_index)
+    if failed_ops:
+        document.add_heading("Not Applied (Manual Review Required)", level=2)
+        document.add_paragraph("Recommended recovery steps:")
+        document.add_paragraph("1. Re-run with multiple Ralph passes (`--ralph 3` or higher).")
+        document.add_paragraph("2. Re-run from apply/report once patch artifacts are refreshed.")
+        document.add_paragraph("3. If still blocked, apply the remaining suggestions manually in Word.")
+
+        table = document.add_table(rows=1, cols=5)
+        try:
+            table.style = "Table Grid"
+        except Exception:
+            pass
+
+        header_cells = table.rows[0].cells
+        header_cells[0].text = "#"
+        header_cells[1].text = "At"
+        header_cells[2].text = "Suggestion"
+        header_cells[3].text = "Failure"
+        header_cells[4].text = "Recovery"
+
+        for failed in failed_ops:
+            at_text, suggestion_text = _format_failed_change_for_display(failed)
+            reason = str(failed.get("skip_reason", "")).strip() or "unknown"
+            guidance = str(failed.get("failure_guidance", "")).strip() or GENERIC_RECOVERY_GUIDANCE
+
+            cells = table.add_row().cells
+            cells[0].text = str(next_index)
+            _write_markdown_bold_to_paragraph(cells[1].paragraphs[0], at_text)
+            _write_markdown_bold_to_paragraph(cells[2].paragraphs[0], suggestion_text)
+            cells[3].text = reason
+            cells[4].text = guidance
+            next_index += 1
+
+        document.add_paragraph("")
 
     output_docx_path.parent.mkdir(parents=True, exist_ok=True)
     document.save(output_docx_path)
@@ -1288,6 +1426,7 @@ def build_change_report_payload(
         raise ValueError("merged_patch.json must include a list at key 'ops'.")
 
     changes: list[dict[str, Any]] = []
+    failed_ops: list[dict[str, Any]] = []
 
     for op_index, raw_op in enumerate(raw_ops):
         op = raw_op if isinstance(raw_op, dict) else {}
@@ -1295,8 +1434,8 @@ def build_change_report_payload(
 
         op_target = _normalize_target(op.get("target"))
         apply_entry = apply_by_index.get(op_index, {})
-        if str(apply_entry.get("status", "")).strip() and str(apply_entry.get("status", "")).strip() != "applied":
-            continue
+        raw_status = str(apply_entry.get("status", "")).strip().lower()
+        apply_status = raw_status if raw_status else "missing"
         resolved_target = _normalize_target(apply_entry.get("resolved_target"))
         unit = _resolve_unit(
             op_target=op_target,
@@ -1322,6 +1461,32 @@ def build_change_report_payload(
 
         before = _before_snippet(op, apply_entry)
         after = _after_snippet(op, op_type)
+
+        annotation = _comment_text_from_op(op) if op_type == "add_comment" else None
+        skip_reason = str(apply_entry.get("reason", "")).strip()
+        if apply_status != "applied":
+            if not skip_reason:
+                skip_reason = "missing_apply_log_entry" if apply_status == "missing" else "unknown"
+            failed_ops.append(
+                {
+                    "op_index": op_index,
+                    "type": op_type,
+                    "location": location,
+                    "stable_location": _stable_location_string(location),
+                    "range": {
+                        "start": range_start_u16,
+                        "end": range_end_u16,
+                    },
+                    "before_snippet": before,
+                    "exact_snippet": before,
+                    "after_snippet": after,
+                    "annotation": annotation,
+                    "apply_status": apply_status,
+                    "skip_reason": skip_reason,
+                    "failure_guidance": _failure_guidance_for_reason(skip_reason),
+                }
+            )
+            continue
 
         # Skip true no-op edits only (exact match), but keep whitespace-only edits.
         if op_type in ("replace_range", "insert_at", "delete_range") and before == after:
@@ -1350,8 +1515,6 @@ def build_change_report_payload(
             range_start_u16=range_start_u16,
             range_end_u16=range_end_u16,
         )
-
-        annotation = _comment_text_from_op(op) if op_type == "add_comment" else None
 
         # Keep the original exact snippet for replacements
         original_before = before
@@ -1408,7 +1571,14 @@ def build_change_report_payload(
     changes.sort(key=lambda item: int(item.get("op_index", 10**9)))
     changes = _strip_internal_change_fields(changes)
 
-    stats = {"op_count": len(changes)}
+    failed_ops.sort(key=lambda item: int(item.get("op_index", 10**9)))
+
+    stats = {
+        "input_patch_ops": len(raw_ops),
+        "op_count": len(changes),
+        "applied_op_count": len(changes),
+        "failed_op_count": len(failed_ops),
+    }
 
     return {
         "schema_version": CHANGE_REPORT_SCHEMA_VERSION,
@@ -1418,6 +1588,7 @@ def build_change_report_payload(
         "source_apply_log": str(source_apply_log),
         "stats": stats,
         "changes": changes,
+        "failed_ops": failed_ops,
     }
 
 
