@@ -1,85 +1,29 @@
 # academic-ai
 
-DOCX review pipeline with deterministic artifacts and writer-facing outputs.
+AI-assisted DOCX review pipeline for long documents.
 
-## Project Contract (Phase 0)
+It takes a `.docx`, extracts deterministic text units, runs chunk-based review agents, merges suggestions into a single patch, applies tracked changes/comments to DOCX, and produces writer-facing change reports.
 
-All pipeline skills are being standardized to a single required CLI flag:
+## Experimental Status
 
-- `--project-dir projects/<project_slug>`
+This repository is experimental. Do not trust generated `*_annotated.docx` files blindly.
+Always review the output manually in Word before accepting changes. Bugs can still produce
+unintended document mutations beyond strict comment/suggestion behavior.
 
-Path resolution contract:
+## What You Get
 
-- Input DOCX files are resolved under `--project-dir/input/`
-- Intermediate files are resolved under `<project-dir>/artifacts/` with per-input subpaths
-- Final files are resolved under `<project-dir>/output/...`
-- Workflow files are resolved under `<project-dir>/workflows/...`
+For each input file `<input_name>.docx`:
 
-Planned default structure:
+- `projects/<project>/output/<input_name>_annotated.docx`
+- `projects/<project>/output/<input_name>_changes.md`
+- `projects/<project>/output/<input_name>_changes.json`
+- `projects/<project>/output/<input_name>_changes.docx`
 
-```text
-projects/<project_slug>/
-  input/
-    file1.docx
-    file2.docx
-    ...
-  workflows/<workflow_name>.xml
-  artifacts/
-    docx_extract/<input_name>/
-    chunks/<input_name>/
-    ralph_0/chunk_results/<input_name>/
-    ralph_1/chunk_results/<input_name>/
-    ...
-    judged/chunk_results/<input_name>/
-    patch/<input_name>/
-    apply/<input_name>/
-  output/
-    <input_name>_annotated.docx
-    <input_name>_changes.docx
-    <input_name>_changes.md
-    <input_name>_changes.json
-```
+Intermediates/logs are written under `projects/<project>/artifacts/`.
 
-Agent contracts (used by `scripts/run_project.py`):
+## Quick Start
 
-- prompt templates in `templates/`:
-  - `chunk_qa.xml`
-  - `chunk_review.xml`
-  - `ralph_judge.xml`
-  - `merge_qa.xml`
-- JSON output schemas in `schemas/`:
-  - `chunk_qa.schema.json`
-  - `chunk_result.schema.json`
-  - `merge_qa.schema.json`
-
-Deterministic chunk-boundary fixes (runner behavior):
-
-- source of truth is `artifacts/chunks/manifest.json` chunk order
-- `merge_adjacent(left,right)` merges adjacent chunks into left, removes right
-- `shift_boundary(left,right,move_primary_units)` shifts primary ownership:
-  - positive: move right -> left
-  - negative: move left -> right
-- fixes are applied in chunk index order, then chunks are regenerated and reindexed
-
-## Path Rules
-
-- Final writer-facing outputs live in `projects/<project>/output/` only:
-  - `<input_name>_annotated.docx`
-  - `<input_name>_changes.docx`
-  - `<input_name>_changes.md`
-  - `<input_name>_changes.json`
-- Intermediate/runtime artifacts live in `projects/<project>/artifacts/` only.
-- Source input DOCX is any `.docx` under `projects/<project>/input/` (or `--input <filename>`).
-- Workflow policy is `projects/<project>/workflows/<workflow>.xml`.
-
-## Prerequisites
-
-- Python 3.10+ (`.venv/bin/python` is used automatically when present, otherwise `python3`).
-- `pytest` installed in the selected Python environment for `make test`.
-- `python-docx` installed for DOCX change report generation (`<input_name>_changes.docx`).
-- `curl` or `wget` for `make fixtures` (manual fallback is documented in `fixtures/README.md`).
-
-## Setup
+1. Create environment.
 
 ```bash
 python3 -m venv .venv
@@ -87,141 +31,147 @@ python3 -m venv .venv
 python -m pip install --upgrade pip pytest python-docx
 ```
 
-## Runbook
+Already included in this repo:
 
-1. Create or refresh a project scaffold:
+- `projects/thesis/`
+- `projects/thesis/workflows/fr_copyedit_conservative.xml`
+- `projects/thesis/workflows/fr_copyedit_micro.xml`
+
+You can run immediately by adding a DOCX to `projects/thesis/input/`.
+
+2. (Optional) Scaffold a new project (only if you want another project besides `thesis`).
 
 ```bash
-make project PROJECT=thesis
+make project PROJECT=my_project
 ```
 
-2. Put your source DOCX file(s) in:
+3. Put one or more `.docx` files in:
 
 ```text
 projects/thesis/input/
 ```
 
-You can add multiple `.docx` files. Each file will be processed independently with outputs named after the input file.
+Built-in starter workflows:
 
-3. Run the workflow:
+- `fr_copyedit_conservative`
+- `fr_copyedit_micro`
+
+4. Run a first dry run (no AI calls):
 
 ```bash
-# If only one file in input/, it will be auto-selected
-make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative DRY_RUN=1
+```
 
-# If multiple files exist, specify which one to process
+5. Configure AI CLI, then run real review:
+
+```bash
+python scripts/setup_cli_env.py --check
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx CLI=codex
+```
+
+## What A Workflow Run Does
+
+Each `make run` execution:
+
+1. Extracts the DOCX into structured review units.
+2. Splits units into chunk files (`primary_units` editable, context read-only).
+3. Runs AI review per chunk using your selected workflow XML policy.
+4. Merges and safety-checks all suggested operations.
+5. Applies operations to DOCX as tracked changes/comments.
+6. Generates markdown/json/docx change reports.
+
+## Run Modes
+
+Use one of these:
+
+```bash
+# 1) Safety smoke run (no AI calls)
+make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative DRY_RUN=1
+
+# 2) Normal real run (recommended default)
 make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
 
-# Process files one by one (outputs are never overwritten)
-make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx
-make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter2.docx
-
-# Ralphing ensemble with 3 sequential review runs + judge reconciliation
+# 3) Higher-confidence run (ensemble + judge)
 make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx RALPH=3
-
-# Skip judge and merge directly from ralph_0 results
-make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative INPUT=chapter1.docx RALPH=3 SKIP_JUDGE=1
 ```
 
-4. Read final outputs (named after the input file):
-
-```text
-projects/thesis/output/<input_name>_annotated.docx
-projects/thesis/output/<input_name>_changes.docx
-projects/thesis/output/<input_name>_changes.md
-projects/thesis/output/<input_name>_changes.json
-```
-
-For example, if you processed `chapter1.docx`:
-```text
-projects/thesis/output/chapter1_annotated.docx
-projects/thesis/output/chapter1_changes.docx
-projects/thesis/output/chapter1_changes.md
-projects/thesis/output/chapter1_changes.json
-```
-
-5. Offline CI/e2e smoke (no Codex calls):
+Resume if a run was interrupted:
 
 ```bash
-make e2e
+make resume PROJECT=thesis WORKFLOW=fr_copyedit_conservative FROM=merge INPUT=chapter1.docx
+make resume PROJECT=thesis WORKFLOW=fr_copyedit_conservative FROM_RALPH=1 RALPH=3 INPUT=chapter1.docx
 ```
 
-6. Unit tests:
+Other useful commands:
 
 ```bash
-make test
+make fixtures   # download public fixture
+make e2e        # offline smoke workflow
+make test       # unit/integration tests
 ```
 
-## Runner Command
+## Runner CLI
 
-```bash
-.venv/bin/python scripts/run_project.py \
-  --project thesis \
-  --workflow fr_copyedit_conservative \
-  --ralph 1
-```
-
-Specify an input file with `--input`:
-
-```bash
-.venv/bin/python scripts/run_project.py \
-  --project thesis \
-  --workflow fr_copyedit_conservative \
-  --input chapter1.docx
-```
-
-Use `--dry-run` to avoid CLI calls and generate synthetic chunk review outputs:
-
-```bash
-.venv/bin/python scripts/run_project.py \
-  --project thesis \
-  --workflow fr_copyedit_conservative \
-  --dry-run
-```
-
-Use `--ralph N` to run ensemble reviews, and `--skip-judge` to use `ralph_0` directly:
+Equivalent direct command:
 
 ```bash
 .venv/bin/python scripts/run_project.py \
   --project thesis \
   --workflow fr_copyedit_conservative \
   --input chapter1.docx \
-  --ralph 3
-
-.venv/bin/python scripts/run_project.py \
-  --project thesis \
-  --workflow fr_copyedit_conservative \
-  --input chapter1.docx \
-  --ralph 3 \
-  --skip-judge
+  --cli codex
 ```
 
-Use `--cli` to select the CLI provider (`codex` or `kimi`, default is `codex`):
+Useful flags:
+
+- `--dry-run`: generates synthetic chunk results (no AI calls)
+- `--ralph N`: run `N` sequential review passes
+- `--from-step judge|merge|apply|report`: resume from stage
+- `--from-ralph N`: resume ensemble from Ralph run index `N`
+- `--model <name>`: pass model to selected CLI backend
+- `--skip-judge`: advanced/debug flag for `--ralph > 1` runs
+
+## CLI Backends
+
+`run_project.py` supports:
+
+- `--cli codex` (default)
+- `--cli claude`
+- `--cli kimi`
+
+Use `scripts/setup_cli_env.py` for setup checks and instructions:
 
 ```bash
-.venv/bin/python scripts/run_project.py \
-  --project thesis \
-  --workflow fr_copyedit_conservative \
-  --cli kimi
+python scripts/setup_cli_env.py --check
+python scripts/setup_cli_env.py --setup-codex
+python scripts/setup_cli_env.py --setup-claude
+python scripts/setup_cli_env.py --setup-kimi
 ```
 
-Or via make:
+## Project Layout
 
-```bash
-make run PROJECT=thesis WORKFLOW=fr_copyedit_conservative CLI=kimi
+```text
+projects/<project>/
+  input/*.docx
+  workflows/*.xml
+  artifacts/
+    docx_extract/<input_name>/
+    chunks/<input_name>/
+    ralph_0/chunk_results/<input_name>/
+    ...
+    judged/chunk_results/<input_name>/
+    patch/<input_name>/
+    apply/<input_name>/
+  output/
+    <input_name>_annotated.docx
+    <input_name>_changes.md
+    <input_name>_changes.json
+    <input_name>_changes.docx
 ```
 
 ## Troubleshooting
 
-- `Workflow XML not found`: create or verify `projects/<project>/workflows/<workflow>.xml`.
-- `Workflow name mismatch`: ensure workflow root has `<workflow name="<workflow>">`.
-- `Source DOCX not found`: place a `.docx` file under `projects/<project>/input/` or pass `--input <filename>`.
-- `codex CLI was not found on PATH`: install/configure Codex CLI or run with `--dry-run`.
-- `kimi CLI was not found on PATH`: install Kimi CLI (https://moonshotai.github.io/kimi-cli/) or run with `--dry-run`.
-- `Chunk QA still failing after deterministic fixes`: inspect `projects/<project>/artifacts/chunks/<input_name>/chunk_qa_report.json`.
-- `Missing output files`: inspect `projects/<project>/artifacts/patch/<input_name>/merge_report.json` and `projects/<project>/artifacts/apply/<input_name>/apply_log.json`.
-
-## Notes
-
-- `make clean` removes generated files under root `artifacts/` and `output/` (legacy targets).
-- Project runs write intermediates under `projects/<project>/artifacts/`.
+- Multiple files in `input/` with no `INPUT=...` or `--input`: choose one explicitly.
+- Workflow file must exist at `projects/<project>/workflows/<workflow>.xml` and `<workflow name="...">` must match filename.
+- Missing CLI binary/API setup: run `python scripts/setup_cli_env.py --check`.
+- Missing expected outputs: inspect `projects/<project>/artifacts/patch/<input_name>/merge_report.json` and `projects/<project>/artifacts/apply/<input_name>/apply_log.json`.
